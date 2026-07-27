@@ -9,11 +9,11 @@ from typing import Any, Callable, Optional
 
 def auto_import_enabled() -> bool:
     """
-    默认开启自动入库。
-    关闭：AUTO_IMPORT=0 / false / off / no
+    默认关闭自动入库（主流程不入库，页面手动导入）。
+    开启：AUTO_IMPORT=1 / true / on / yes
     """
-    raw = (os.environ.get("AUTO_IMPORT") or "1").strip().lower()
-    return raw not in ("0", "false", "off", "no", "none")
+    raw = (os.environ.get("AUTO_IMPORT") or "0").strip().lower()
+    return raw in ("1", "true", "on", "yes", "y")
 
 
 def import_clean_file(

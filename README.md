@@ -8,7 +8,7 @@ Web 控制台 + same-session 注册引擎，支持临时邮箱、Turnstile、Cas
 - 临时邮箱自动建邮 / 收码（cloudflare_temp_email）
 - 本地 Camoufox Turnstile Solver（也可接 YesCaptcha）
 - 多线程并发、实时日志与进度
-- 注册成功后可选自动导入 sub2api（HTTP Admin API / sso-to-oauth）
+- 注册成功后由页面「导入」手动入库 sub2api（HTTP Admin API / sso-to-oauth；`AUTO_IMPORT=1` 可开自动）
 - 按**分组名称**自动解析 sub2api `group_id`（ID 只读缓存）
 
 ## 目录结构
@@ -70,6 +70,7 @@ cp .env.example .env
 | `SOLVER_BROWSER` | `camoufox` / `chromium` | `camoufox` |
 | `SOLVER_THREADS` | Solver 浏览器线程 | `4` |
 | `UI_HOST` / `UI_PORT` | Web 监听 | `127.0.0.1` / `3333` |
+| `GROK_PROXY` | 注册代理；空=直连。支持 `host:port` / URL / `user:pass@host:port` / `host:port:user:pass` | 空 |
 | `SUB2API_URL` | sub2api 根地址 | `http://127.0.0.1:9898` |
 | `SUB2API_GROK_GROUP_NAME` | 导入目标分组**名称**（按名称解析 ID） | `grok` |
 | `SUB2API_GROK_GROUP_ID` | 可选缓存；运行时会按名称回写 | 空 |
@@ -81,6 +82,7 @@ cp .env.example .env
 - 页面「配置」里只填**分组名称**；分组 ID 只读显示，保存/测试/导入时自动拉取。
 - 名称匹配的是 sub2api **已有**分组（可跨 platform）；新分组请先在 sub2api 后台创建。
 - 导入主路径：`POST /api/v1/admin/grok/sso-to-oauth`（服务端换票）。
+- 默认**不**自动入库；需要自动时在 `.env` 设 `AUTO_IMPORT=1`。
 
 ## 使用
 
@@ -101,7 +103,7 @@ python app.py
 
 打开：`http://127.0.0.1:3333`
 
-- **配置**：邮箱 / Solver / sub2api / 分组名称
+- **配置**：邮箱 / Solver / 注册代理 / sub2api / 分组名称
 - **运行**：选择 `same_session`、并发、数量后开始
 - **Keys**：下载 SSO 文件，一键导入 sub2api
 

@@ -175,16 +175,24 @@ _SS_VIEWPORT_BASES = (
 
 
 def _ss_local_proxy_spec() -> str:
-    """同会话默认本机代理：STANDALONE_LOCAL_PROXY / LOCAL_PROXY / 127.0.0.1:7897。"""
-    raw = (
-        os.environ.get("STANDALONE_LOCAL_PROXY")
-        or os.environ.get("LOCAL_PROXY")
-        or os.environ.get("GROK_SAME_SESSION_PROXY")
-        or "127.0.0.1:7897"
-    ).strip()
-    if not raw:
-        return "127.0.0.1:7897"
-    return raw
+    """
+    same_session 代理：
+      GROK_PROXY / XAI_PROXY / SAME_SESSION_PROXY / GROK_SAME_SESSION_PROXY
+      / STANDALONE_LOCAL_PROXY / LOCAL_PROXY
+    全空 = 直连（不再默认写死 7897）。
+    """
+    for key in (
+        "GROK_PROXY",
+        "XAI_PROXY",
+        "SAME_SESSION_PROXY",
+        "GROK_SAME_SESSION_PROXY",
+        "STANDALONE_LOCAL_PROXY",
+        "LOCAL_PROXY",
+    ):
+        raw = (os.environ.get(key) or "").strip()
+        if raw:
+            return raw
+    return ""
 
 
 def _ss_pick_fp(idx: int = 0) -> dict[str, Any]:
@@ -1199,6 +1207,8 @@ class RegisterEngine:
         self.target_count = 0
         self.workers = 0
         self.start_time: Optional[float] = None
+        # 任务结束后冻结耗时，避免 get_status 继续 now-start 空转计时
+        self.end_time: Optional[float] = None
         self.output_file: Optional[str] = None
         self.status = "idle"  # idle | initializing | running | stopping | done | error
         self.error_message = ""
@@ -1228,11 +1238,25 @@ class RegisterEngine:
             self._ss_idx += 1
             return self._ss_idx
 
+    def _freeze_elapsed(self) -> None:
+        """任务结束时钉死 end_time，页面耗时不再往上爬。"""
+        if self.start_time and self.end_time is None:
+            self.end_time = time.time()
+
     def get_status(self) -> dict:
         elapsed = 0.0
         avg = 0.0
         if self.start_time:
-            elapsed = max(0.0, time.time() - self.start_time)
+            # 运行中：实时；已结束：用 end_time 冻结，禁止空转计时
+            if self.status in ("initializing", "running", "stopping"):
+                end = time.time()
+            else:
+                end = self.end_time if self.end_time is not None else self.start_time
+                # 兼容旧进程：done 了但没 end_time，立刻钉死一次
+                if self.end_time is None and self.status in ("done", "error", "idle"):
+                    self.end_time = time.time()
+                    end = self.end_time
+            elapsed = max(0.0, float(end) - float(self.start_time))
             if self.success_count > 0:
                 avg = elapsed / self.success_count
         progress = 0.0
@@ -2899,24 +2923,21 @@ class RegisterEngine:
                         token_ready += 1
                 if left > 0:
                     self.log(
-                        f"仍有 {left} 个后台 NSFW/协议未完成；token/已导入 "
-                        f"{token_ready}/{self.success_count}（其中已导入 {imported_n}）",
+                        f"仍有 {left} 个后台 NSFW/协议未完成；token 就绪 "
+                        f"{token_ready}/{self.success_count}"
+                        f"（不自动入库，页面手动导入）",
                         "warn",
                     )
                 else:
                     self.log(
-                        f"流水线收尾：token/已导入 {token_ready}/{self.success_count}"
-                        f"（已导入 {imported_n}；缺票才走 sso-to-oauth/兜底）",
+                        f"流水线收尾：token 就绪 {token_ready}/{self.success_count}"
+                        f"（不自动入库 · 点「导入」手动入库）",
                         "success" if token_ready else "warn",
                     )
             except Exception:
                 pass
-            # same_session：自动入库（优先 recent_success 缓存 token；已导入则跳过）
-            if resolve_register_mode(getattr(self, "register_mode", None)) == "same_session":
-                try:
-                    self._auto_import_clean_accounts()
-                except Exception as ie:
-                    self.log(f"自动入库异常: {ie}", "warn")
+            # 主流程不自动入库：CLEAN/token 只落盘 + recent_success，
+            # 入库改由页面「导入」手动点（避免跑完就直写 sub2api）
             # same_session 浏览器池收尾
             if resolve_register_mode(getattr(self, "register_mode", None)) == "same_session":
                 try:
@@ -2959,6 +2980,8 @@ class RegisterEngine:
             self.stop_event.set()
             if self.status not in ("done", "error"):
                 self.status = "done"
+            # 钉死耗时：结束后前端轮询不再让「已用时间」空转
+            self._freeze_elapsed()
             # 任务结束即停看门狗，避免空闲时反复拉起已崩溃的 Solver
             try:
                 import solver_manager
@@ -3126,6 +3149,7 @@ class RegisterEngine:
             self.register_mode = reg_mode
             self._ss_idx = 0
             self.start_time = time.time()
+            self.end_time = None  # 新一轮重新计时
             self.error_message = ""
             self.recent_success.clear()
             # 先标 initializing，避免并发 /api/start 重复拉起

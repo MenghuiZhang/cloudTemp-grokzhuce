@@ -1564,8 +1564,9 @@ def same_session_register(
                             )
                             break
                         page.wait_for_timeout(react_poll)
-                except Exception as reload_exc:
-                    out["steps"].append(f"reload_err:{type(reload_exc).__name__}")
+                except Exception as reload_err:
+                    # 禁止 as re：会遮蔽 import re，后续 re.search 直接 UnboundLocalError
+                    out["steps"].append(f"reload_err:{type(reload_err).__name__}")
             else:
                 pr = timing_cfg["post_react_ms"]
                 lo_pr, hi_pr = int(pr[0]), int(pr[1])

@@ -51,6 +51,7 @@ CONFIG_KEYS = (
     "UPSTREAM_URL",
     "UPSTREAM_ADMIN_EMAIL",
     "UPSTREAM_ADMIN_PASSWORD",
+    "GROK_PROXY",
 )
 
 DEFAULTS = {
@@ -79,6 +80,8 @@ DEFAULTS = {
     "UPSTREAM_URL": "http://127.0.0.1:9898",
     "UPSTREAM_ADMIN_EMAIL": "",
     "UPSTREAM_ADMIN_PASSWORD": "",
+    # 注册代理：空=直连；支持 host:port / http://host:port / user:pass@host:port / host:port:user:pass
+    "GROK_PROXY": "",
 }
 
 
@@ -154,6 +157,9 @@ def write_env_file(values: dict) -> None:
             f"UI_HOST={values.get('UI_HOST', DEFAULTS['UI_HOST'])}",
             f"UI_PORT={values.get('UI_PORT', DEFAULTS['UI_PORT'])}",
             "",
+            "# 注册代理（空=直连）",
+            f"GROK_PROXY={values.get('GROK_PROXY', DEFAULTS.get('GROK_PROXY', ''))}",
+            "",
             "# sub2api Grok（成功账号导入）",
             f"SUB2API_URL={values.get('SUB2API_URL', DEFAULTS['SUB2API_URL'])}",
             f"SUB2API_DOCKER_CONTAINER={values.get('SUB2API_DOCKER_CONTAINER', DEFAULTS['SUB2API_DOCKER_CONTAINER'])}",
@@ -173,11 +179,25 @@ def write_env_file(values: dict) -> None:
     ENV_PATH.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
 
 
+def _sync_proxy_env_aliases() -> None:
+    """把 GROK_PROXY 同步到注册链路读取的别名；空则全部清掉。"""
+    proxy = (os.environ.get("GROK_PROXY") or "").strip()
+    for alias in ("GROK_PROXY", "XAI_PROXY", "SAME_SESSION_PROXY", "GROK_SAME_SESSION_PROXY"):
+        if proxy:
+            os.environ[alias] = proxy
+        else:
+            os.environ.pop(alias, None)
+
+
 def apply_env_to_process(values: dict) -> None:
     for k, v in values.items():
         os.environ[k] = v or ""
     # reload dotenv for any other readers
     load_dotenv(ENV_PATH, override=True)
+    # 以最终进程环境为准再同步代理别名（避免 dotenv 覆盖后别名不一致）
+    if "GROK_PROXY" in values:
+        os.environ["GROK_PROXY"] = str(values.get("GROK_PROXY") or "").strip()
+    _sync_proxy_env_aliases()
 
 
 def env_snapshot():
@@ -203,6 +223,8 @@ def env_snapshot():
         "solver_threads": cfg.get("SOLVER_THREADS") or DEFAULTS["SOLVER_THREADS"],
         "ui_host": cfg.get("UI_HOST") or DEFAULTS["UI_HOST"],
         "ui_port": cfg.get("UI_PORT") or DEFAULTS["UI_PORT"],
+        "grok_proxy": (cfg.get("GROK_PROXY") or "").strip(),
+        "grok_proxy_set": bool((cfg.get("GROK_PROXY") or "").strip()),
         "sub2api_url": sub2_url,
         "sub2api_container": sub2["container"],
         "sub2api_group_id": sub2["group_id"],
@@ -1693,6 +1715,7 @@ def get_config():
             "SOLVER_DEBUG": cfg.get("SOLVER_DEBUG", DEFAULTS["SOLVER_DEBUG"]),
             "UI_HOST": cfg.get("UI_HOST", DEFAULTS["UI_HOST"]),
             "UI_PORT": cfg.get("UI_PORT", DEFAULTS["UI_PORT"]),
+            "GROK_PROXY": cfg.get("GROK_PROXY", DEFAULTS.get("GROK_PROXY", "")),
             "SUB2API_URL": cfg.get("SUB2API_URL", cfg.get("UPSTREAM_URL", DEFAULTS["SUB2API_URL"])),
             "SUB2API_DOCKER_CONTAINER": cfg.get("SUB2API_DOCKER_CONTAINER", DEFAULTS["SUB2API_DOCKER_CONTAINER"]),
             "SUB2API_DB_HOST": cfg.get("SUB2API_DB_HOST", DEFAULTS["SUB2API_DB_HOST"]),
@@ -1764,6 +1787,11 @@ def save_config():
     solver_debug = str(body.get("SOLVER_DEBUG", current.get("SOLVER_DEBUG", DEFAULTS["SOLVER_DEBUG"]))).strip() or "1"
     ui_host = str(body.get("UI_HOST", current.get("UI_HOST", DEFAULTS["UI_HOST"]))).strip() or "127.0.0.1"
     ui_port = str(body.get("UI_PORT", current.get("UI_PORT", DEFAULTS["UI_PORT"]))).strip() or "3333"
+    # 代理：前端显式传空表示直连；未传则保留已有
+    if "GROK_PROXY" in body:
+        grok_proxy = str(body.get("GROK_PROXY") or "").strip()
+    else:
+        grok_proxy = str(current.get("GROK_PROXY", DEFAULTS.get("GROK_PROXY", "")) or "").strip()
     sub2api_url = str(body.get("SUB2API_URL", body.get("UPSTREAM_URL", current.get("SUB2API_URL", current.get("UPSTREAM_URL", DEFAULTS["SUB2API_URL"]))))).strip()
     sub2api_container = str(body.get("SUB2API_DOCKER_CONTAINER", current.get("SUB2API_DOCKER_CONTAINER", DEFAULTS["SUB2API_DOCKER_CONTAINER"]))).strip() or DEFAULTS["SUB2API_DOCKER_CONTAINER"]
     sub2api_db_host = str(body.get("SUB2API_DB_HOST", current.get("SUB2API_DB_HOST", DEFAULTS["SUB2API_DB_HOST"]))).strip() or DEFAULTS["SUB2API_DB_HOST"]
@@ -1845,6 +1873,7 @@ def save_config():
         "SOLVER_DEBUG": "1" if solver_debug not in ("0", "false", "False") else "0",
         "UI_HOST": ui_host,
         "UI_PORT": ui_port,
+        "GROK_PROXY": grok_proxy,
         "SUB2API_URL": sub2api_url,
         "SUB2API_DOCKER_CONTAINER": sub2api_container,
         "SUB2API_DB_HOST": sub2api_db_host,
