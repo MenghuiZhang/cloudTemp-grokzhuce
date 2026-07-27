@@ -479,6 +479,16 @@
                     </div>
                   </div>
                   <div>
+                    <label class="field-label" for="cfgAdminKey">FREEMAIL_ADMIN_KEY</label>
+                    <div class="secret-wrap">
+                      <input id="cfgAdminKey" type="password" class="field font-mono text-sm" placeholder="管理员密码（可选）" autocomplete="off" spellcheck="false" />
+                      <button type="button" class="toggle-eye" data-target="cfgAdminKey" aria-label="显示/隐藏" title="显示/隐藏">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                      </button>
+                    </div>
+                    <p class="hint">配置后通过 /admin/new_address 建邮</p>
+                  </div>
+                  <div>
                     <div class="flex items-center justify-between gap-2 mb-1">
                       <label class="field-label" style="margin-bottom:0" for="cfgMailDomain">邮箱后缀</label>
                       <button type="button" id="btnFetchDomains" class="btn btn-ghost text-[11px] px-2 py-0.5">拉取</button>
@@ -492,6 +502,15 @@
                       <input type="hidden" id="cfgMailDomain" value="auto" />
                     </div>
                     <p id="mailDomainHint" class="hint">点「拉取」从 freemail 取可用后缀</p>
+                  </div>
+                  <div class="rounded-xl border border-ink-900/8 bg-paper-100 px-3 py-2.5">
+                    <label class="flex items-start gap-2.5 cursor-pointer" for="cfgRandomSubdomain">
+                      <input id="cfgRandomSubdomain" type="checkbox" class="mt-0.5 rounded border-paper-300 text-brand-500 focus:ring-brand-500/30" />
+                      <span>
+                        <span class="block text-xs font-semibold text-ink-800">Cloudflare 随机子域名</span>
+                        <span id="randomSubdomainHint" class="block mt-1 text-[11px] leading-relaxed text-ink-700/50">创建 name@&lt;随机串&gt;.&lt;基础域名&gt;，需 Worker 和通配 MX 支持</span>
+                      </span>
+                    </label>
                   </div>
                 </div>
 
@@ -891,22 +910,53 @@
     );
 
     const AUTO_DOMAIN_OPT = { value: 'auto', label: '自动（服务端默认）' };
+    let randomSubdomainDomains = new Set();
+    let randomSubdomainDomainsLoaded = false;
     const mailDomainSelect = initSelect(
       document.querySelector('[data-select="cfgMailDomain"]'),
       [AUTO_DOMAIN_OPT],
-      'auto'
+      'auto',
+      () => updateRandomSubdomainHint()
     );
 
-    function buildDomainOptions(domains, defaults) {
+    function buildDomainOptions(domains, defaults, randomDomains = []) {
       const opts = [AUTO_DOMAIN_OPT];
       const defSet = new Set((defaults || []).map(String));
+      const randomSet = new Set((randomDomains || []).map(String));
       for (const d of domains || []) {
         const v = String(d).trim();
         if (!v || v === 'auto') continue;
-        const tag = defSet.has(v) ? '（默认）' : '';
-        opts.push({ value: v, label: tag ? `${v} ${tag}` : v });
+        const tags = [];
+        if (defSet.has(v)) tags.push('默认');
+        if (randomSet.has(v)) tags.push('支持随机子域');
+        opts.push({ value: v, label: tags.length ? `${v}（${tags.join(' / ')}）` : v });
       }
       return opts;
+    }
+
+    function updateRandomSubdomainHint() {
+      const checkbox = $('cfgRandomSubdomain');
+      const hint = $('randomSubdomainHint');
+      if (!checkbox || !hint) return;
+      const selected = ($('cfgMailDomain').value || 'auto').trim();
+      if (!randomSubdomainDomainsLoaded) {
+        hint.textContent = '创建 name@<随机串>.<基础域名>；拉取域名后可校验 Worker 支持情况';
+        hint.className = 'block mt-1 text-[11px] leading-relaxed text-ink-700/50';
+        return;
+      }
+      const compatible = selected === 'auto'
+        ? randomSubdomainDomains.size > 0
+        : randomSubdomainDomains.has(selected);
+      if (compatible) {
+        const detail = selected === 'auto'
+          ? `将自动使用 ${Array.from(randomSubdomainDomains)[0]}`
+          : `${selected} 已在 Worker 的 RANDOM_SUBDOMAIN_DOMAINS 中`;
+        hint.textContent = `${detail}；仍需配置通配 * MX 记录`;
+        hint.className = 'block mt-1 text-[11px] leading-relaxed text-leaf-600';
+      } else {
+        hint.textContent = '当前基础域名不支持随机子域名，请在 Worker 配置 RANDOM_SUBDOMAIN_DOMAINS';
+        hint.className = 'block mt-1 text-[11px] leading-relaxed text-rose-500';
+      }
     }
 
     $('targetCustom').addEventListener('input', () => {
@@ -1070,7 +1120,10 @@
         $('envWorker').textContent = okW ? (data.env.worker_domain || '已配置') : '未配置';
         $('envWorker').className = `font-mono truncate max-w-[58%] text-right ${okW ? 'text-leaf-600' : 'text-rose-500'}`;
         const md = data.env.freemail_domain || 'auto';
-        $('envMailDomain').textContent = md === 'auto' ? '自动' : md;
+        const mdLabel = md === 'auto' ? '自动' : md;
+        $('envMailDomain').textContent = data.env.freemail_random_subdomain
+          ? `${mdLabel} · 随机子域`
+          : mdLabel;
         $('envMailDomain').className = 'font-mono text-ink-800';
         $('envToken').textContent = okT ? '已配置' : '未配置';
         $('envToken').className = `font-mono ${okT ? 'text-leaf-600' : 'text-rose-500'}`;
@@ -1282,7 +1335,10 @@
       const worker = $('cfgWorker').value.trim();
       const token = $('cfgToken').value.trim();
       const hint = $('mailDomainHint');
+      randomSubdomainDomainsLoaded = false;
       if (!worker) {
+        randomSubdomainDomains = new Set();
+        updateRandomSubdomainHint();
         if (!silent) {
           hint.textContent = '请先填写 WORKER_DOMAIN 再拉取';
           hint.className = 'mt-1 text-[11px] text-rose-500';
@@ -1300,8 +1356,11 @@
         const data = await res.json().catch(() => ({}));
         const domains = data.domains || [];
         const defaults = data.default_domains || [];
+        const randomDomains = data.random_subdomain_domains || [];
         const selected = data.selected || $('cfgMailDomain').value || 'auto';
-        mailDomainSelect._setOptions(buildDomainOptions(domains, defaults), true);
+        randomSubdomainDomains = new Set(randomDomains.map(String));
+        randomSubdomainDomainsLoaded = !!data.ok;
+        mailDomainSelect._setOptions(buildDomainOptions(domains, defaults, randomDomains), true);
         // 若当前选中不在列表且不是 auto，保留；否则用接口 selected
         const cur = $('cfgMailDomain').value;
         if (cur && (cur === 'auto' || domains.includes(cur))) {
@@ -1309,8 +1368,12 @@
         } else if (selected) {
           mailDomainSelect._setValue(selected, true);
         }
+        updateRandomSubdomainHint();
         if (data.ok) {
-          hint.textContent = data.message || `已拉取 ${domains.length} 个域名`;
+          const randomNote = randomDomains.length
+            ? `，其中 ${randomDomains.length} 个支持随机子域`
+            : '，未启用随机子域';
+          hint.textContent = (data.message || `已拉取 ${domains.length} 个域名`) + randomNote;
           hint.className = 'mt-1 text-[11px] text-leaf-600';
         } else {
           hint.textContent = data.message || '拉取失败';
@@ -1318,6 +1381,8 @@
         }
         return data;
       } catch (e) {
+        randomSubdomainDomains = new Set();
+        updateRandomSubdomainHint();
         if (!silent) {
           hint.textContent = e.message || '拉取失败';
           hint.className = 'mt-1 text-[11px] text-rose-500';
@@ -1334,6 +1399,7 @@
         const c = data.config || {};
         $('cfgWorker').value = c.WORKER_DOMAIN || '';
         $('cfgToken').value = c.FREEMAIL_TOKEN || '';
+        $('cfgAdminKey').value = c.FREEMAIL_ADMIN_KEY || '';
         $('cfgYes').value = c.YESCAPTCHA_KEY || '';
         $('cfgSolver').value = c.SOLVER_URL || 'http://127.0.0.1:5072';
         $('cfgSolverThreads').value = c.SOLVER_THREADS || '2';
@@ -1351,11 +1417,17 @@
         $('yesCaptchaBlock').classList.toggle('hidden', mode !== 'yescaptcha');
 
         const savedDomain = (c.FREEMAIL_DOMAIN || 'auto').trim() || 'auto';
+        $('cfgRandomSubdomain').checked = ['1', 'true', 'yes', 'on'].includes(
+          String(c.FREEMAIL_RANDOM_SUBDOMAIN || '0').toLowerCase()
+        );
+        randomSubdomainDomains = new Set();
+        randomSubdomainDomainsLoaded = false;
         mailDomainSelect._setOptions(buildDomainOptions(
           savedDomain !== 'auto' ? [savedDomain] : [],
           []
         ), false);
         mailDomainSelect._setValue(savedDomain, true);
+        updateRandomSubdomainHint();
 
         setMessage($('configMessage'), '已加载当前配置', true);
         if ($('upstreamTestMessage')) {
@@ -1460,7 +1532,9 @@
       const payload = {
         WORKER_DOMAIN: $('cfgWorker').value.trim(),
         FREEMAIL_TOKEN: $('cfgToken').value.trim(),
+        FREEMAIL_ADMIN_KEY: $('cfgAdminKey').value.trim(),
         FREEMAIL_DOMAIN: ($('cfgMailDomain').value || 'auto').trim() || 'auto',
+        FREEMAIL_RANDOM_SUBDOMAIN: $('cfgRandomSubdomain').checked,
         YESCAPTCHA_KEY: captchaMode === 'yescaptcha' ? $('cfgYes').value.trim() : '',
         SOLVER_URL: $('cfgSolver').value.trim() || 'http://127.0.0.1:5072',
         SOLVER_BROWSER: $('cfgSolverBrowser').value || 'camoufox',
@@ -1478,6 +1552,16 @@
       if (!payload.WORKER_DOMAIN || !payload.FREEMAIL_TOKEN) {
         setMessage($('configMessage'), 'WORKER_DOMAIN 与 FREEMAIL_TOKEN 为必填', false);
         return;
+      }
+      if (payload.FREEMAIL_RANDOM_SUBDOMAIN && randomSubdomainDomainsLoaded) {
+        const selected = payload.FREEMAIL_DOMAIN;
+        const compatible = selected === 'auto'
+          ? randomSubdomainDomains.size > 0
+          : randomSubdomainDomains.has(selected);
+        if (!compatible) {
+          setMessage($('configMessage'), '当前邮箱域名不在 Worker 的 RANDOM_SUBDOMAIN_DOMAINS 中', false);
+          return;
+        }
       }
       setMessage($('configMessage'), '保存中...', true);
       $('btnSaveConfig').disabled = true;
@@ -1734,6 +1818,12 @@
     $('btnReloadConfig').addEventListener('click', loadConfig);
     $('btnRefreshKeys').addEventListener('click', refreshKeys);
     $('btnFetchDomains').addEventListener('click', () => fetchMailDomains(false));
+    $('cfgWorker').addEventListener('input', () => {
+      randomSubdomainDomains = new Set();
+      randomSubdomainDomainsLoaded = false;
+      updateRandomSubdomainHint();
+    });
+    $('cfgRandomSubdomain').addEventListener('change', updateRandomSubdomainHint);
 
     $('btnSolverStart').addEventListener('click', async () => {
       $('btnSolverStart').disabled = true;

@@ -67,7 +67,9 @@ cp .env.example .env
 |--------|------|------|
 | `WORKER_DOMAIN` | cloudflare_temp_email 的 Worker 域名（不要 `https://`） | — |
 | `FREEMAIL_TOKEN` | 站点密码 / JWT | — |
+| `FREEMAIL_ADMIN_KEY` | 可选；`ADMIN_PASSWORDS` 中的管理员密码，配置后通过 `/admin/new_address` 建邮 | 空 |
 | `FREEMAIL_DOMAIN` | 邮箱后缀；`auto` 用服务端默认 | `auto` |
+| `FREEMAIL_RANDOM_SUBDOMAIN` | `1` 时创建随机二级域名邮箱（需 Worker 与 DNS 支持） | `0` |
 | `FREEMAIL_API_STYLE` | `auto` / `cf_temp` / `freemail` | `auto` |
 | `YESCAPTCHA_KEY` | 有则走 YesCaptcha；空则本地 Solver | 空 |
 | `SOLVER_URL` | 本地 Solver 地址 | `http://127.0.0.1:5072` |
@@ -88,6 +90,9 @@ cp .env.example .env
 - 导入主路径：`POST /api/v1/admin/grok/sso-to-oauth`（服务端换票）。
 - 默认**不**自动入库；需要自动时在 `.env` 设 `AUTO_IMPORT=1`。
 - Token 换票 / 协议 / NSFW 在成功后异步后台跑，不堵注册主路径。
+- 随机子域名需在 cloudflare_temp_email Worker 配置
+  `RANDOM_SUBDOMAIN_DOMAINS=["example.com"]`，并为基础域名配置通配
+  `*` MX 记录；否则地址可创建但收不到邮件。
 
 ## 使用
 

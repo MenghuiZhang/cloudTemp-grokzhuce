@@ -26,9 +26,11 @@ class EmailService:
     """
     优先适配 dreamhunter2333/cloudflare_temp_email：
       POST /api/new_address
+      POST /admin/new_address（配置 FREEMAIL_ADMIN_KEY 时）
       GET  /api/mails?limit=&offset=
       DELETE /api/delete_address
     FREEMAIL_TOKEN 作为 x-custom-auth（站点密码），不是 JWT。
+    FREEMAIL_ADMIN_KEY 作为 x-admin-auth（管理员密码）。
     每个邮箱会拿到独立 jwt，内部维护。
     """
 
@@ -36,7 +38,9 @@ class EmailService:
         load_dotenv(override=True)
         self.worker_domain = self.normalize_domain(os.getenv("WORKER_DOMAIN") or "")
         self.freemail_token = (os.getenv("FREEMAIL_TOKEN") or "").strip()
+        self.admin_key = (os.getenv("FREEMAIL_ADMIN_KEY") or "").strip()
         self.mail_domain = (os.getenv("FREEMAIL_DOMAIN") or "").strip()  # 邮箱后缀，如 kikru.xyz
+        self.random_subdomain = self._env_bool("FREEMAIL_RANDOM_SUBDOMAIN")
         if not self.worker_domain:
             raise ValueError("Missing: WORKER_DOMAIN")
         self.base_url = f"https://{self.worker_domain}"
@@ -55,6 +59,13 @@ class EmailService:
             .strip()
             .rstrip("/")
         )
+
+    @staticmethod
+    def _env_bool(name: str, default: bool = False) -> bool:
+        value = (os.getenv(name) or "").strip().lower()
+        if not value:
+            return default
+        return value in ("1", "true", "yes", "on", "enabled")
 
     @staticmethod
     def _build_session() -> requests.Session:
@@ -94,6 +105,7 @@ class EmailService:
                 "ok": False,
                 "domains": [],
                 "default_domains": [],
+                "random_subdomain_domains": [],
                 "selected": selected,
                 "message": "请先填写 WORKER_DOMAIN",
                 "settings": {},
@@ -129,6 +141,7 @@ class EmailService:
                 "ok": False,
                 "domains": [],
                 "default_domains": [],
+                "random_subdomain_domains": [],
                 "selected": selected,
                 "message": f"拉取域名失败: {last_err or '无响应'}",
                 "settings": {},
@@ -148,6 +161,11 @@ class EmailService:
             for d in (settings.get("defaultDomains") or [])
             if str(d).strip()
         ]
+        random_subdomain_domains = [
+            str(d).strip()
+            for d in (settings.get("randomSubdomainDomains") or [])
+            if str(d).strip()
+        ]
         if selected and selected not in domains and selected != "auto":
             # 仍展示当前已选，即使接口未返回
             domains.insert(0, selected)
@@ -160,6 +178,7 @@ class EmailService:
             "ok": True,
             "domains": domains,
             "default_domains": defaults,
+            "random_subdomain_domains": random_subdomain_domains,
             "selected": selected_out,
             "message": f"已拉取 {len(domains)} 个域名" if domains else "接口无域名列表",
             "settings": {
@@ -183,17 +202,27 @@ class EmailService:
             h["Authorization"] = f"Bearer {jwt}"
         return h
 
+    def _admin_headers(self) -> dict:
+        headers = self._auth_headers()
+        if self.admin_key:
+            headers["x-admin-auth"] = self.admin_key
+        return headers
+
     def _random_name(self, n: int = 10) -> str:
         return "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
 
     def create_email(self):
         """创建临时邮箱，返回 (jwt, email)"""
         style = self._api_style
+        if self.random_subdomain and style not in ("auto", "cf_temp", "cloudflare"):
+            print("[-] 随机子域名仅支持 cloudflare_temp_email API")
+            return None, None
         if style in ("auto", "cf_temp", "cloudflare"):
             result = self._create_cf_temp()
             if result[0] and result[1]:
                 return result
-            if style != "auto":
+            # 用户明确要求随机子域名时不能静默降级成普通 freemail 地址。
+            if style != "auto" or self.random_subdomain:
                 return None, None
         return self._create_freemail_legacy()
 
@@ -204,18 +233,47 @@ class EmailService:
             return None
         return d
 
+    def _resolve_random_subdomain_domain(self) -> Optional[str]:
+        """随机子域名必须显式提交一个 Worker 已允许的基础域名。"""
+        mail_domain = self._resolve_mail_domain()
+        if mail_domain:
+            return mail_domain
+
+        # FREEMAIL_DOMAIN=auto 时，从 Worker 的 RANDOM_SUBDOMAIN_DOMAINS
+        # 选择第一个基础域名，保证 enableRandomSubdomain 请求仍然有效。
+        settings = self.fetch_mail_domains(
+            worker_domain=self.worker_domain,
+            token=self.freemail_token,
+        )
+        domains = settings.get("random_subdomain_domains") or []
+        return str(domains[0]).strip() if domains else None
+
     def _create_cf_temp(self):
         try:
-            mail_domain = self._resolve_mail_domain()
+            mail_domain = (
+                self._resolve_random_subdomain_domain()
+                if self.random_subdomain
+                else self._resolve_mail_domain()
+            )
+            if self.random_subdomain and not mail_domain:
+                print(
+                    "[-] 创建邮箱失败(cf): 已启用随机子域名，但 Worker "
+                    "未返回 RANDOM_SUBDOMAIN_DOMAINS"
+                )
+                return None, None
+            use_admin_api = bool(self.admin_key)
+            create_path = "/admin/new_address" if use_admin_api else "/api/new_address"
             for attempt in range(2):
                 name = self._random_name(10 if attempt == 0 else 12)
                 payload: dict = {"name": name}
                 if mail_domain:
                     payload["domain"] = mail_domain
+                if self.random_subdomain:
+                    payload["enableRandomSubdomain"] = True
                 res = self._session.post(
-                    f"{self.base_url}/api/new_address",
+                    f"{self.base_url}{create_path}",
                     json=payload,
-                    headers=self._auth_headers(),
+                    headers=self._admin_headers() if use_admin_api else self._auth_headers(),
                     timeout=20,
                 )
                 if res.status_code == 200:
@@ -228,9 +286,15 @@ class EmailService:
                         return jwt, email
                 # 名称冲突再试
                 if res.status_code != 400:
-                    print(f"[-] 创建邮箱失败(cf): {res.status_code} - {res.text[:200]}")
+                    print(
+                        f"[-] 创建邮箱失败(cf {create_path}): "
+                        f"{res.status_code} - {res.text[:200]}"
+                    )
                     return None, None
-            print(f"[-] 创建邮箱失败(cf): 重试后仍失败")
+            print(
+                f"[-] 创建邮箱失败(cf {create_path}): "
+                f"{res.status_code} - {res.text[:200]}"
+            )
             return None, None
         except Exception as e:
             print(f"[-] 创建邮箱失败(cf): {e}")

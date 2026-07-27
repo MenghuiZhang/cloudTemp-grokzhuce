@@ -91,7 +91,9 @@ engine = RegisterEngine(log_fn=_route_engine_log)
 CONFIG_KEYS = (
     "WORKER_DOMAIN",
     "FREEMAIL_TOKEN",
+    "FREEMAIL_ADMIN_KEY",
     "FREEMAIL_DOMAIN",
+    "FREEMAIL_RANDOM_SUBDOMAIN",
     "FREEMAIL_API_STYLE",
     "YESCAPTCHA_KEY",
     "SOLVER_URL",
@@ -120,7 +122,9 @@ CONFIG_KEYS = (
 DEFAULTS = {
     "WORKER_DOMAIN": "",
     "FREEMAIL_TOKEN": "",
+    "FREEMAIL_ADMIN_KEY": "",
     "FREEMAIL_DOMAIN": "auto",
+    "FREEMAIL_RANDOM_SUBDOMAIN": "0",
     "FREEMAIL_API_STYLE": "auto",
     "YESCAPTCHA_KEY": "",
     "SOLVER_URL": "http://127.0.0.1:5072",
@@ -203,7 +207,9 @@ def write_env_file(values: dict) -> None:
             "# freemail API 配置",
             f"WORKER_DOMAIN={values.get('WORKER_DOMAIN', '')}",
             f"FREEMAIL_TOKEN={values.get('FREEMAIL_TOKEN', '')}",
+            f"FREEMAIL_ADMIN_KEY={values.get('FREEMAIL_ADMIN_KEY', '')}",
             f"FREEMAIL_DOMAIN={values.get('FREEMAIL_DOMAIN', DEFAULTS['FREEMAIL_DOMAIN'])}",
+            f"FREEMAIL_RANDOM_SUBDOMAIN={values.get('FREEMAIL_RANDOM_SUBDOMAIN', DEFAULTS['FREEMAIL_RANDOM_SUBDOMAIN'])}",
             f"FREEMAIL_API_STYLE={values.get('FREEMAIL_API_STYLE', DEFAULTS['FREEMAIL_API_STYLE'])}",
             "",
             "# Turnstile 验证配置",
@@ -269,6 +275,10 @@ def env_snapshot():
     token = cfg.get("FREEMAIL_TOKEN", "").strip()
     yes = cfg.get("YESCAPTCHA_KEY", "").strip()
     mail_domain = (cfg.get("FREEMAIL_DOMAIN") or DEFAULTS["FREEMAIL_DOMAIN"]).strip() or "auto"
+    random_subdomain = (
+        cfg.get("FREEMAIL_RANDOM_SUBDOMAIN")
+        or DEFAULTS["FREEMAIL_RANDOM_SUBDOMAIN"]
+    ).strip().lower() in ("1", "true", "yes", "on")
     sub2 = get_sub2api_config_from_cfg(cfg)
     sub2_url = sub2["url"]
     admin_email = sub2.get("admin_email") or ""
@@ -281,6 +291,7 @@ def env_snapshot():
         "yescaptcha_set": bool(yes),
         "worker_domain": worker,
         "freemail_domain": mail_domain,
+        "freemail_random_subdomain": random_subdomain,
         "solver_url": cfg.get("SOLVER_URL") or DEFAULTS["SOLVER_URL"],
         "solver_browser": cfg.get("SOLVER_BROWSER") or DEFAULTS["SOLVER_BROWSER"],
         "solver_threads": cfg.get("SOLVER_THREADS") or DEFAULTS["SOLVER_THREADS"],
@@ -1767,7 +1778,12 @@ def get_config():
         "config": {
             "WORKER_DOMAIN": cfg.get("WORKER_DOMAIN", ""),
             "FREEMAIL_TOKEN": cfg.get("FREEMAIL_TOKEN", ""),
+            "FREEMAIL_ADMIN_KEY": cfg.get("FREEMAIL_ADMIN_KEY", ""),
             "FREEMAIL_DOMAIN": cfg.get("FREEMAIL_DOMAIN", DEFAULTS["FREEMAIL_DOMAIN"]),
+            "FREEMAIL_RANDOM_SUBDOMAIN": cfg.get(
+                "FREEMAIL_RANDOM_SUBDOMAIN",
+                DEFAULTS["FREEMAIL_RANDOM_SUBDOMAIN"],
+            ),
             "FREEMAIL_API_STYLE": cfg.get("FREEMAIL_API_STYLE", DEFAULTS["FREEMAIL_API_STYLE"]),
             "YESCAPTCHA_KEY": cfg.get("YESCAPTCHA_KEY", ""),
             "SOLVER_URL": cfg.get("SOLVER_URL", DEFAULTS["SOLVER_URL"]),
@@ -1795,6 +1811,7 @@ def get_config():
         },
         "masked": {
             "FREEMAIL_TOKEN": mask_secret(cfg.get("FREEMAIL_TOKEN", "")),
+            "FREEMAIL_ADMIN_KEY": mask_secret(cfg.get("FREEMAIL_ADMIN_KEY", "")),
             "YESCAPTCHA_KEY": mask_secret(cfg.get("YESCAPTCHA_KEY", "")),
             "SUB2API_DB_PASSWORD": mask_secret(cfg.get("SUB2API_DB_PASSWORD", DEFAULTS["SUB2API_DB_PASSWORD"])),
             "UPSTREAM_ADMIN_PASSWORD": mask_secret(cfg.get("UPSTREAM_ADMIN_PASSWORD", "")),
@@ -1823,6 +1840,7 @@ def mail_domains():
             "ok": False,
             "domains": [],
             "default_domains": [],
+            "random_subdomain_domains": [],
             "selected": "auto",
             "message": str(e),
             "settings": {},
@@ -1839,7 +1857,26 @@ def save_config():
 
     worker = str(body.get("WORKER_DOMAIN", current.get("WORKER_DOMAIN", ""))).strip()
     token = str(body.get("FREEMAIL_TOKEN", current.get("FREEMAIL_TOKEN", ""))).strip()
+    admin_key = str(
+        body.get(
+            "FREEMAIL_ADMIN_KEY",
+            current.get("FREEMAIL_ADMIN_KEY", ""),
+        )
+    ).strip()
     mail_domain = str(body.get("FREEMAIL_DOMAIN", current.get("FREEMAIL_DOMAIN", DEFAULTS["FREEMAIL_DOMAIN"]))).strip() or "auto"
+    random_subdomain_raw = body.get(
+        "FREEMAIL_RANDOM_SUBDOMAIN",
+        current.get(
+            "FREEMAIL_RANDOM_SUBDOMAIN",
+            DEFAULTS["FREEMAIL_RANDOM_SUBDOMAIN"],
+        ),
+    )
+    random_subdomain = (
+        random_subdomain_raw
+        if isinstance(random_subdomain_raw, bool)
+        else str(random_subdomain_raw).strip().lower()
+        in ("1", "true", "yes", "on")
+    )
     api_style = str(body.get("FREEMAIL_API_STYLE", current.get("FREEMAIL_API_STYLE", DEFAULTS["FREEMAIL_API_STYLE"]))).strip() or "auto"
     yes = str(body.get("YESCAPTCHA_KEY", current.get("YESCAPTCHA_KEY", ""))).strip()
     solver = str(body.get("SOLVER_URL", current.get("SOLVER_URL", DEFAULTS["SOLVER_URL"]))).strip()
@@ -1884,6 +1921,8 @@ def save_config():
     # 允许前端传空密钥表示“保留原值”：用特殊标记
     if body.get("FREEMAIL_TOKEN") is None:
         token = current.get("FREEMAIL_TOKEN", "")
+    if body.get("FREEMAIL_ADMIN_KEY") is None:
+        admin_key = current.get("FREEMAIL_ADMIN_KEY", "")
     if body.get("YESCAPTCHA_KEY") is None:
         yes = current.get("YESCAPTCHA_KEY", "")
     if body.get("UPSTREAM_ADMIN_EMAIL") is None:
@@ -1925,7 +1964,9 @@ def save_config():
     values = {
         "WORKER_DOMAIN": worker,
         "FREEMAIL_TOKEN": token,
+        "FREEMAIL_ADMIN_KEY": admin_key,
         "FREEMAIL_DOMAIN": mail_domain,
+        "FREEMAIL_RANDOM_SUBDOMAIN": "1" if random_subdomain else "0",
         "FREEMAIL_API_STYLE": api_style,
         "YESCAPTCHA_KEY": yes,
         "SOLVER_URL": solver,
@@ -1953,7 +1994,11 @@ def save_config():
     try:
         write_env_file(values)
         apply_env_to_process(values)
-        logs.emit(f"配置已保存到 .env（邮箱域名: {mail_domain}）", "success")
+        random_label = "，随机子域名: 开" if random_subdomain else ""
+        logs.emit(
+            f"配置已保存到 .env（邮箱域名: {mail_domain}{random_label}）",
+            "success",
+        )
 
         # 保存后自动测试 sub2api HTTP 通道，并按名称解析 group_id 回写
         upstream_test = None
