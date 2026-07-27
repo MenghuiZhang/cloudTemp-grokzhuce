@@ -11,6 +11,7 @@ import concurrent.futures
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -20,7 +21,20 @@ from urllib.parse import urljoin
 from curl_cffi import requests
 from bs4 import BeautifulSoup
 
-from g import EmailService, TurnstileService, UserAgreementService, NsfwSettingsService
+from g import (
+    EmailService,
+    TurnstileService,
+    UserAgreementService,
+    NsfwSettingsService,
+    CastleService,
+    same_session_register,
+    parse_proxy_spec,
+)
+
+try:
+    from g import AntibotService
+except Exception:  # pragma: no cover
+    AntibotService = None  # type: ignore
 
 
 # 基础配置
@@ -45,21 +59,219 @@ CHROME_PROFILES = [
     {"impersonate": "chrome120", "version": "120.0.0.0", "brand": "chrome"},
     {"impersonate": "edge101", "version": "101.0.1210.47", "brand": "edge"},
 ]
-# device flow 全局串行：避免本机并发 curl_cffi 与 Docker 内 TLS 踩踏
-_DEVICE_FLOW_LOCK = threading.Lock()
+# device flow 有限并发：2 路并行换票，限流时自动退回更保守节奏
+# （全串行太慢；无上限又容易 TLS/rate_limited 把成功率打穿）
+_DEVICE_FLOW_MAX_CONCURRENT = 2
+_DEVICE_FLOW_SEM = threading.Semaphore(_DEVICE_FLOW_MAX_CONCURRENT)
 # 全局冷却：遇到 rate_limited 后，后续 device flow 至少隔这么久
 _device_flow_cooldown_until = 0.0
 _device_flow_cooldown_lock = threading.Lock()
+# 成功后的轻冷却：压连打限流，又别像旧 2s 那样白白垫时间
+_DEVICE_FLOW_SUCCESS_COOLDOWN = 0.6
+# 是否在 device approve 后轮询 token。默认开启（生产要最终换到 token）。
+# 仅诊断「假批准」时设 GROK_DEVICE_FLOW_ISSUE_TOKEN=0 跳过换票。
+DEVICE_FLOW_ISSUE_TOKEN = os.environ.get("GROK_DEVICE_FLOW_ISSUE_TOKEN", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+# Action ID 缓存：页面发版后 id 会变，过长缓存会让注册 server action 打空
+_ACTION_CACHE_TTL = int(os.environ.get("GROK_ACTION_CACHE_TTL", str(30 * 60)))  # 默认 30 分钟
+
+# 注册路径：
+#   same_session = 同页 castle mint + 页内 fetch（CLEAN 主路径，默认）
+#   protocol     = 旧混合协议（Camoufox 拆会话 mint + curl signup，易 CASTLE deny）
+_REGISTER_MODE_DEFAULT = "same_session"
+_VALID_REGISTER_MODES = ("same_session", "protocol", "legacy", "hybrid")
 
 
-def _enrich_worker_count() -> int:
-    """SSO 后后台 enrich（device flow / 协议 / NSFW）线程数。"""
-    raw = (os.environ.get("ENRICH_WORKERS") or "12").strip()
-    try:
-        n = int(raw)
-    except ValueError:
-        n = 12
-    return max(1, min(n, 32))
+def resolve_register_mode(raw: Optional[str] = None) -> str:
+    """归一化注册模式。legacy/hybrid 等同 protocol。"""
+    m = (raw if raw is not None else os.environ.get("GROK_REGISTER_MODE") or _REGISTER_MODE_DEFAULT)
+    m = str(m or "").strip().lower()
+    if m in ("same_session", "ss", "clean", "same-session", "samesession"):
+        return "same_session"
+    if m in ("protocol", "legacy", "hybrid", "curl", "old"):
+        return "protocol"
+    return _REGISTER_MODE_DEFAULT
+
+
+# same_session 指纹地区（locale/timezone；代理默认本机）
+# 多区 + 双 OS，配合 camoufox 池限次/多槽，避免同一指纹出口连号
+_SS_FP_REGIONS = [
+    {
+        "tag": "US-W",
+        "locale": "en-US",
+        "timezone": "America/Los_Angeles",
+        "fp_os": "windows",
+    },
+    {
+        "tag": "US-E",
+        "locale": "en-US",
+        "timezone": "America/New_York",
+        "fp_os": "windows",
+    },
+    {
+        "tag": "US-C",
+        "locale": "en-US",
+        "timezone": "America/Chicago",
+        "fp_os": "macos",
+    },
+    {
+        "tag": "AU",
+        "locale": "en-AU",
+        "timezone": "Australia/Sydney",
+        "fp_os": "windows",
+    },
+    {
+        "tag": "AU-MEL",
+        "locale": "en-AU",
+        "timezone": "Australia/Melbourne",
+        "fp_os": "macos",
+    },
+    {
+        "tag": "JP",
+        "locale": "ja-JP",
+        "timezone": "Asia/Tokyo",
+        "fp_os": "windows",
+    },
+    {
+        "tag": "GB",
+        "locale": "en-GB",
+        "timezone": "Europe/London",
+        "fp_os": "windows",
+    },
+    {
+        "tag": "CA",
+        "locale": "en-CA",
+        "timezone": "America/Toronto",
+        "fp_os": "macos",
+    },
+    {
+        "tag": "DE",
+        "locale": "de-DE",
+        "timezone": "Europe/Berlin",
+        "fp_os": "windows",
+    },
+    {
+        "tag": "SG",
+        "locale": "en-SG",
+        "timezone": "Asia/Singapore",
+        "fp_os": "windows",
+    },
+]
+_SS_FP_OS_POOL = ("windows", "macos")
+_SS_VIEWPORT_BASES = (
+    (1366, 768),
+    (1440, 900),
+    (1536, 864),
+    (1600, 900),
+    (1680, 1050),
+    (1920, 1080),
+    (1280, 800),
+    (1512, 982),  # mac-ish
+)
+
+
+def _ss_local_proxy_spec() -> str:
+    """同会话默认本机代理：STANDALONE_LOCAL_PROXY / LOCAL_PROXY / 127.0.0.1:7897。"""
+    raw = (
+        os.environ.get("STANDALONE_LOCAL_PROXY")
+        or os.environ.get("LOCAL_PROXY")
+        or os.environ.get("GROK_SAME_SESSION_PROXY")
+        or "127.0.0.1:7897"
+    ).strip()
+    if not raw:
+        return "127.0.0.1:7897"
+    return raw
+
+
+def _ss_pick_fp(idx: int = 0) -> dict[str, Any]:
+    """
+    打散指纹：地区/时区/OS/分辨率/时序尽量轮转+抖动，
+    避免同 worker 连号撞同一 camoufox 出口画像。
+    """
+    n = len(_SS_FP_REGIONS)
+    if idx and n:
+        # 主序轮转 + 邻域随机，避免严格周期被识别
+        base = (max(0, int(idx) - 1) * 3 + random.randint(0, 2)) % n
+        # 30% 完全随机跳区
+        if random.random() < 0.30:
+            region = random.choice(_SS_FP_REGIONS)
+        else:
+            region = _SS_FP_REGIONS[base]
+    else:
+        region = random.choice(_SS_FP_REGIONS)
+
+    timing_env = (
+        os.environ.get("STANDALONE_TIMING")
+        or os.environ.get("GROK_SS_TIMING")
+        or "rotate"
+    ).strip().lower()
+    if timing_env in ("rotate", "random", "rand", "mix", ""):
+        # 默认 rotate：turbo/fast 为主，偶发 normal
+        timing = random.choices(
+            ["turbo", "fast", "normal"], weights=[50, 35, 15], k=1
+        )[0]
+    elif timing_env in ("turbo", "fast", "normal", "human", "slow"):
+        # 固定档也掺一点抖动
+        if random.random() < 0.25:
+            timing = random.choice(["turbo", "fast", "normal"])
+        else:
+            timing = timing_env
+    else:
+        timing = random.choice(["turbo", "fast", "normal"])
+
+    os_env = (
+        os.environ.get("STANDALONE_FP_OS") or os.environ.get("GROK_SS_FP_OS") or ""
+    ).strip().lower()
+    if os_env in ("win", "windows"):
+        fp_os = "windows"
+    elif os_env in ("mac", "macos", "osx"):
+        fp_os = "macos"
+    elif os_env in ("rotate", "random", "mix", "auto", ""):
+        # 默认打散 OS：地区偏好 60% + 池内随机 40%
+        pref = str(region.get("fp_os") or "windows").strip().lower()
+        if pref not in _SS_FP_OS_POOL:
+            pref = "windows"
+        if random.random() < 0.40:
+            fp_os = random.choice(list(_SS_FP_OS_POOL))
+        else:
+            fp_os = pref
+    else:
+        fp_os = "windows"
+
+    vw, vh = random.choice(_SS_VIEWPORT_BASES)
+    # 分辨率再抖一截，避免整批同一 window
+    vw = max(1200, vw + random.randint(-24, 24))
+    vh = max(700, vh + random.randint(-18, 18))
+
+    hum_env = (
+        os.environ.get("STANDALONE_HUMANIZE")
+        or os.environ.get("GROK_SAME_SESSION_HUMANIZE")
+        or ""
+    ).strip().lower()
+    if hum_env in ("1", "true", "yes", "on"):
+        humanize = True
+    elif hum_env in ("0", "false", "no", "off"):
+        humanize = False
+    else:
+        # 默认：非 turbo 开一点 humanize；turbo 也 15% 概率开
+        if timing in ("turbo", "fast"):
+            humanize = random.random() < 0.15
+        else:
+            humanize = True
+
+    return {
+        "tag": region.get("tag") or "LOCAL",
+        "locale": region.get("locale") or "en-US",
+        "timezone": region.get("timezone") or "America/Los_Angeles",
+        "fp_os": fp_os,
+        "timing": timing,
+        "viewport": {"width": vw, "height": vh},
+        "humanize": humanize,
+    }
 
 
 def get_random_chrome_profile():
@@ -204,29 +416,140 @@ def _wait_device_flow_cooldown() -> None:
         time.sleep(min(remain, 120.0))
 
 
-def _request_device_code(timeout: int = 20) -> dict | None:
-    data = urllib.parse.urlencode(
-        {"client_id": GROK_CLI_CLIENT_ID, "scope": OIDC_SCOPES}
-    ).encode()
-    req = urllib.request.Request(
-        f"{OIDC_ISSUER}/oauth2/device/code",
-        data=data,
-        method="POST",
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
-        },
+def _proxy_kw() -> dict:
+    """统一代理参数：显式 PROXIES 优先；否则不传，避免误绑死掉的系统代理。"""
+    return {"proxies": PROXIES} if PROXIES else {}
+
+
+def _extract_signup_action_id(js_or_html: str) -> Optional[str]:
+    """
+    从 Next.js chunk / HTML 提取 sign-up 的 server action id。
+    优先 createServerReference(\"...\", ..., \"default\")，兼容裸 7f… 哈希。
+    """
+    text = js_or_html or ""
+    # 命名 default 的注册 action（当前页面真源）
+    m = re.search(
+        r'createServerReference\)?\(\s*["\']([a-f0-9]{40,44})["\'][^)]*?["\']default["\']',
+        text,
     )
+    if m:
+        return m.group(1)
+    m = re.search(
+        r'createServerReference\)?\(\s*["\'](7f[a-f0-9]{40})["\']',
+        text,
+    )
+    if m:
+        return m.group(1)
+    m = re.search(r"\b(7f[a-fA-F0-9]{40})\b", text)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _parse_device_consent_page(html: str, page_url: str = "") -> dict[str, str]:
+    """
+    从 OAuth 同意页 HTML 解析当前版本的 approve form。
+    页面仍是 form POST（非 server action）；字段/action URL 以页面为准自动跟随。
+    """
+    out = {
+        "approve_url": f"{OIDC_ISSUER}/oauth2/device/approve",
+        "user_code": "",
+        "principal_type": "User",
+        "principal_id": "",
+        "user_id": "",
+    }
+    text = html or ""
     try:
+        soup = BeautifulSoup(text, "html.parser")
+        form = None
+        for f in soup.find_all("form"):
+            action = (f.get("action") or "").lower()
+            if "device/approve" in action or "approve" in action:
+                form = f
+                break
+        if form is None and soup.find("form"):
+            form = soup.find("form")
+        if form is not None:
+            action = (form.get("action") or "").strip()
+            if action:
+                out["approve_url"] = urljoin(page_url or f"{site_url}/", action)
+            for inp in form.find_all("input"):
+                name = (inp.get("name") or "").strip()
+                val = inp.get("value")
+                if val is None:
+                    val = ""
+                if name == "user_code" and val:
+                    out["user_code"] = str(val)
+                elif name == "principal_type" and val:
+                    out["principal_type"] = str(val)
+                elif name == "principal_id":
+                    out["principal_id"] = str(val)
+    except Exception:
+        pass
+    # RSC/flight 里的 userId（表单 principal_id 常为空，由前端 state 填）
+    m = re.search(r'"userId":"([0-9a-fA-F-]{36})"', text)
+    if m:
+        out["user_id"] = m.group(1)
+        if not out["principal_id"]:
+            out["principal_id"] = m.group(1)
+    m = re.search(
+        r'approveUrl\\?":\\?"(https:[^"\\]+device/approve[^"\\]*)"',
+        text,
+    )
+    if m and not out.get("approve_url"):
+        out["approve_url"] = m.group(1).replace("\\/", "/")
+    m = re.search(r'"approveUrl":"(https:[^"]+device/approve[^"]*)"', text)
+    if m:
+        out["approve_url"] = m.group(1)
+    return out
+
+
+def _request_device_code(timeout: int = 20) -> dict | None:
+    """申请 device_code；优先 curl_cffi（与 session 同栈），失败再回落 urllib。"""
+    data = {
+        "client_id": GROK_CLI_CLIENT_ID,
+        "scope": OIDC_SCOPES,
+    }
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        ),
+    }
+    try:
+        r = requests.post(
+            f"{OIDC_ISSUER}/oauth2/device/code",
+            data=data,
+            headers=headers,
+            impersonate=DEFAULT_IMPERSONATE,
+            timeout=timeout,
+            **_proxy_kw(),
+        )
+        if r.status_code == 429 or "rate" in (r.text or "").lower():
+            return {
+                "_error": f"device/code rate_limited HTTP {r.status_code}: {(r.text or '')[:200]}"
+            }
+        if r.status_code >= 400:
+            return {
+                "_error": f"device/code HTTP {r.status_code}: {(r.text or '')[:200]}"
+            }
+        return r.json()
+    except Exception:
+        pass
+    # 回落 urllib
+    try:
+        req = urllib.request.Request(
+            f"{OIDC_ISSUER}/oauth2/device/code",
+            data=urllib.parse.urlencode(data).encode(),
+            method="POST",
+            headers=headers,
+        )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
-        # 429 / 限流时带上可读信息，便于上层退避
         body = ""
         try:
             body = e.read().decode("utf-8", errors="ignore")[:200]
@@ -245,52 +568,75 @@ def _poll_device_token(
     expires_in: int,
     timeout: int = 60,
 ) -> dict | None:
+    """
+    approve 之后立刻查 token，不再先傻等一个 interval。
+    仍遵守 slow_down / authorization_pending，保证成功率。
+
+    成功返回 token dict；失败返回 None 或 {"_error": "..."}。
+    """
     deadline = time.time() + min(int(expires_in or 1800), timeout)
-    wait = max(2, int(interval or 5))
+    # 服务端 interval 常为 5；我们用更短的本地间隔，被 slow_down 再拉长
+    server_interval = max(1, int(interval or 5))
+    wait = min(1.2, float(server_interval))
     net_fail = 0
+    first = True
+    last_err = "token poll timeout"
+    form = {
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "client_id": GROK_CLI_CLIENT_ID,
+        "device_code": device_code,
+    }
+    headers = {"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"}
     while time.time() < deadline:
-        time.sleep(wait)
-        data = urllib.parse.urlencode(
-            {
-                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                "client_id": GROK_CLI_CLIENT_ID,
-                "device_code": device_code,
-            }
-        ).encode()
-        req = urllib.request.Request(
-            f"{OIDC_ISSUER}/oauth2/token",
-            data=data,
-            method="POST",
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
+        if not first:
+            time.sleep(wait)
+        first = False
         try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                return json.loads(resp.read())
-        except urllib.error.HTTPError as e:
+            r = requests.post(
+                f"{OIDC_ISSUER}/oauth2/token",
+                data=form,
+                headers=headers,
+                impersonate=DEFAULT_IMPERSONATE,
+                timeout=20,
+                **_proxy_kw(),
+            )
+            body_text = r.text or ""
             try:
-                err = json.loads(e.read())
+                body = r.json() if body_text else {}
             except Exception:
-                net_fail += 1
-                if net_fail >= 4:
-                    return None
-                wait = min(wait + 2, 12)
-                continue
-            error = err.get("error", "")
+                body = {}
+            if r.status_code < 400 and (body.get("access_token") or body.get("key")):
+                return body
+            error = (body.get("error") if isinstance(body, dict) else "") or ""
             if error == "authorization_pending":
                 net_fail = 0
+                wait = min(max(wait, float(server_interval) * 0.6), 6.0)
+                last_err = "authorization_pending"
                 continue
             if error == "slow_down":
-                wait += 3
+                wait = min(wait + 3.0, 15.0)
+                last_err = "slow_down"
                 continue
-            return None
-        except Exception:
+            if error:
+                desc = body.get("error_description") or ""
+                last_err = f"{error}" + (f": {desc}" if desc else "")
+                # invalid_grant / access_denied / expired_token：别空转
+                return {"_error": last_err}
+            net_fail += 1
+            last_err = f"token HTTP {r.status_code}: {body_text[:160]}"
+            if net_fail >= 5:
+                return {"_error": last_err}
+            wait = min(wait + 1.5, 12.0)
+            continue
+        except Exception as e:
             # 瞬时网络：多试几次，别一次超时就放弃已 approve 的 flow
             net_fail += 1
-            if net_fail >= 5:
-                return None
-            wait = min(wait + 1, 10)
+            last_err = f"token poll 异常: {e}"
+            if net_fail >= 6:
+                return {"_error": last_err}
+            wait = min(wait + 1.0, 10.0)
             continue
-    return None
+    return {"_error": last_err}
 
 
 def _rfc3339_ns(ts: float) -> str:
@@ -343,16 +689,21 @@ def sso_device_flow_to_token(
     *,
     impersonate: str | None = None,
     timeout: int = 28,
+    issue_token: bool | None = None,
 ) -> dict[str, Any]:
     """
     与 grokcli-2api sso_to_auth_json.sso_to_token 同路径：
     SSO cookie → 登录态探测 → OIDC device verify/approve → access_token。
-    只有拿到 access_token 才视为「可导入」。
+
+    issue_token:
+      - None: 跟全局 DEVICE_FLOW_ISSUE_TOKEN（默认 True，换到 access_token）
+      - True: 批准后轮询 token（生产路径）
+      - False: 批准成功即返回（仅诊断用）
 
     加固：
+    - 同意页字段/approve URL 从当前 HTML 自动解析（跟随页面版本）
     - 全局冷却（rate_limited 后拉长间隔）
-    - TLS/超时失败时轮换 impersonate（chrome120 在部分环境会卡死）
-    - device/code 失败返回可读错误
+    - TLS/超时失败时轮换 impersonate
     """
     s = (sso or "").strip()
     if not s:
@@ -360,8 +711,9 @@ def sso_device_flow_to_token(
     if not is_sso_jwt_shape(s):
         return {"ok": False, "error": "非有效 JWT 形态", "token": None, "payload": {}}
 
+    do_token = DEVICE_FLOW_ISSUE_TOKEN if issue_token is None else bool(issue_token)
     payload = decode_jwt_payload(s)
-    proxy_kw = {"proxies": PROXIES} if PROXIES else {}
+    proxy_kw = _proxy_kw()
 
     # 指纹列表：调用方指定的优先，再轮换稳妥指纹
     fps: list[str] = []
@@ -373,23 +725,19 @@ def sso_device_flow_to_token(
     # 最多试 3 个指纹，避免一次导入拖太久
     fps = fps[:3]
 
-    with _DEVICE_FLOW_LOCK:
+    # 有限并发 + 全局冷却：限流时大家一起让路，不把成功率打穿
+    with _DEVICE_FLOW_SEM:
         _wait_device_flow_cooldown()
         last_err = "device flow 失败"
 
         for fp_idx, fp in enumerate(fps):
             try:
-                sess = requests.Session()
-                sess.cookies.set("sso", s, domain=".x.ai")
-                # 同时设 accounts 域，避免部分路径丢 cookie
-                try:
-                    sess.cookies.set("sso", s, domain="accounts.x.ai")
-                except Exception:
-                    pass
+                sess = requests.Session(impersonate=fp)
+                # 浏览器同源 cookie：.x.ai 即可覆盖 accounts / auth
+                sess.cookies.set("sso", s, domain=".x.ai", path="/")
 
                 r = sess.get(
                     "https://accounts.x.ai/",
-                    impersonate=fp,
                     timeout=timeout,
                     allow_redirects=True,
                     **proxy_kw,
@@ -398,7 +746,8 @@ def sso_device_flow_to_token(
                 if "error=rate_limited" in final_url or "rate_limited" in final_url:
                     last_err = f"探测 rate_limited: {r.url}"
                     _mark_device_flow_cooldown(25 + 10 * fp_idx)
-                    continue
+                    # 限流：立刻让路，别继续换指纹连打
+                    break
                 if "sign-in" in final_url or "sign-up" in final_url:
                     return {
                         "ok": False,
@@ -414,7 +763,7 @@ def sso_device_flow_to_token(
                 kind = _device_flow_error_kind(last_err)
                 if kind in ("timeout", "tls"):
                     # 换指纹再试
-                    time.sleep(1.0 + 0.5 * fp_idx)
+                    time.sleep(0.6 + 0.4 * fp_idx)
                     continue
                 return {
                     "ok": False,
@@ -444,31 +793,42 @@ def sso_device_flow_to_token(
                     "payload": payload,
                 }
 
+            user_code = str(dc["user_code"])
+            verify_uri = (
+                dc.get("verification_uri_complete")
+                or f"{site_url}/oauth2/device?user_code={user_code}"
+            )
+            consent_html = ""
+            consent_url = ""
             try:
-                verify_uri = dc.get("verification_uri_complete") or ""
-                if verify_uri:
-                    sess.get(
-                        verify_uri,
-                        impersonate=fp,
-                        timeout=timeout,
-                        allow_redirects=True,
-                        **proxy_kw,
-                    )
+                # 浏览器顺序：先打开 complete URI，再 POST verify
+                sess.get(
+                    verify_uri,
+                    timeout=timeout,
+                    allow_redirects=True,
+                    **proxy_kw,
+                )
                 r = sess.post(
                     f"{OIDC_ISSUER}/oauth2/device/verify",
-                    data={"user_code": dc["user_code"]},
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
-                    impersonate=fp,
+                    data={"user_code": user_code},
+                    headers={
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Origin": site_url,
+                        "Referer": verify_uri,
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    },
                     timeout=timeout,
                     allow_redirects=True,
                     **proxy_kw,
                 )
                 ru = r.url or ""
+                consent_url = ru
+                consent_html = r.text or ""
                 if "rate_limited" in ru.lower() or "error=rate_limited" in ru.lower():
                     last_err = f"device verify 失败: {ru}"
                     _mark_device_flow_cooldown(30 + 10 * fp_idx)
-                    time.sleep(2)
-                    continue
+                    time.sleep(1.5)
+                    break
                 if "consent" not in ru:
                     last_err = f"device verify 失败: {ru}"
                     # 非限流的 verify 失败（如 code 过期）换指纹意义不大，直接返回
@@ -484,7 +844,7 @@ def sso_device_flow_to_token(
                 last_err = f"device verify 异常: {e}"
                 kind = _device_flow_error_kind(last_err)
                 if kind in ("timeout", "tls"):
-                    time.sleep(1.0 + 0.5 * fp_idx)
+                    time.sleep(0.6 + 0.4 * fp_idx)
                     continue
                 return {
                     "ok": False,
@@ -493,61 +853,132 @@ def sso_device_flow_to_token(
                     "payload": payload,
                 }
 
+            # 关键：同意页 form 字段 / approve URL 跟随当前页面版本，不写死
+            page = _parse_device_consent_page(consent_html, consent_url)
+            approve_url = page.get("approve_url") or f"{OIDC_ISSUER}/oauth2/device/approve"
+            # 浏览器 SSR 表单 principal_id 为空；部分号带 userId 也能过——两种都试
+            pid_candidates: list[str] = []
+            page_pid = (page.get("principal_id") or page.get("user_id") or "").strip()
+            # 先空（与页面 hidden 默认一致），再 userId
+            pid_candidates.append("")
+            if page_pid and page_pid not in pid_candidates:
+                pid_candidates.append(page_pid)
+
+            approve_headers = {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": site_url,
+                "Referer": consent_url or verify_uri,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "same-site",
+                "Sec-Fetch-User": "?1",
+            }
+            approved_ok = False
             try:
-                r = sess.post(
-                    f"{OIDC_ISSUER}/oauth2/device/approve",
-                    data={
-                        "user_code": dc["user_code"],
+                for pid in pid_candidates:
+                    approve_data = {
+                        "user_code": page.get("user_code") or user_code,
                         "action": "allow",
-                        "principal_type": "User",
-                        "principal_id": "",
-                    },
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
-                    impersonate=fp,
-                    timeout=timeout,
-                    allow_redirects=True,
-                    **proxy_kw,
-                )
-                ru = r.url or ""
-                if "rate_limited" in ru.lower():
-                    last_err = f"device approve 失败: {ru}"
-                    _mark_device_flow_cooldown(30)
-                    continue
-                if "done" not in ru:
-                    last_err = f"device approve 失败: {ru}"
+                        "principal_type": page.get("principal_type") or "User",
+                        "principal_id": pid,
+                    }
+                    r = sess.post(
+                        approve_url,
+                        data=approve_data,
+                        headers=approve_headers,
+                        timeout=timeout,
+                        allow_redirects=True,
+                        **proxy_kw,
+                    )
+                    ru = r.url or ""
+                    body_low = (r.text or "").lower()
+                    if "rate_limited" in ru.lower():
+                        last_err = f"device approve 失败: {ru}"
+                        _mark_device_flow_cooldown(30)
+                        approved_ok = False
+                        break
+                    # deny 会落到 done?denied=1 —— 这是真拒绝，不是假成功
+                    if "denied=1" in ru.lower():
+                        last_err = f"device approve 被拒绝: {ru}"
+                        return {
+                            "ok": False,
+                            "error": last_err,
+                            "token": None,
+                            "payload": payload,
+                            "approved": False,
+                        }
+                    if "done" in ru or "authorized" in body_low:
+                        approved_ok = True
+                        # 有多个 pid 候选时，本轮只 approve 一次（code 已消耗）
+                        break
+                if not approved_ok and "rate_limited" not in str(last_err):
+                    last_err = f"device approve 失败: {ru if 'ru' in locals() else 'no response'}"
                     return {
                         "ok": False,
                         "error": last_err,
                         "token": None,
                         "payload": payload,
+                        "approved": False,
                     }
+                if not approved_ok:
+                    break
             except Exception as e:
                 last_err = f"device approve 异常: {e}"
                 kind = _device_flow_error_kind(last_err)
                 if kind in ("timeout", "tls"):
-                    time.sleep(1.0 + 0.5 * fp_idx)
+                    time.sleep(0.6 + 0.4 * fp_idx)
                     continue
                 return {
                     "ok": False,
                     "error": last_err,
                     "token": None,
                     "payload": payload,
+                }
+
+            # 诊断模式：只验证同意授权，不下发 token
+            if not do_token:
+                _mark_device_flow_cooldown(_DEVICE_FLOW_SUCCESS_COOLDOWN)
+                return {
+                    "ok": True,
+                    "error": None,
+                    "token": None,
+                    "payload": payload,
+                    "has_refresh": False,
+                    "impersonate": fp,
+                    "approved": True,
+                    "issue_token": False,
+                    "approve_url": approve_url,
+                    "user_code": user_code,
+                    "note": "device approve 成功；已跳过 token 下发（GROK_DEVICE_FLOW_ISSUE_TOKEN=0）",
                 }
 
             token = _poll_device_token(
                 dc["device_code"],
                 int(dc.get("interval") or 5),
                 int(dc.get("expires_in") or 1800),
-                timeout=60,
+                timeout=45,
             )
+            if isinstance(token, dict) and token.get("_error"):
+                last_err = (
+                    f"device approve 后 token 失败: {token.get('_error')}"
+                )
+                # invalid_grant：换指纹整条重来意义有限，但短歇后仍可再试一次会话
+                time.sleep(1.0)
+                continue
             if not token or not (token.get("access_token") or token.get("key")):
-                last_err = "device flow 未拿到 access_token"
-                # approve 已成功但 token 轮询失败：再等一轮短重试（同一 device_code 可能已失效，重新整条）
-                time.sleep(2)
+                # 假批准典型症状：页面已 done，但 token 仍 invalid_grant
+                last_err = (
+                    "device approve 后未拿到 access_token"
+                    "（常见 invalid_grant/Access denied：会话无法真正授权）"
+                )
+                # approve 已成功但 token 轮询失败：短歇后换指纹整条重来
+                time.sleep(1.0)
                 continue
 
-            # 成功后轻微冷却，降低连打触发 rate_limited
-            _mark_device_flow_cooldown(2.0)
+            # 成功后轻冷却，降低连打 rate_limited（比旧 2s 更省）
+            _mark_device_flow_cooldown(_DEVICE_FLOW_SUCCESS_COOLDOWN)
             return {
                 "ok": True,
                 "error": None,
@@ -555,6 +986,8 @@ def sso_device_flow_to_token(
                 "payload": payload,
                 "has_refresh": bool(token.get("refresh_token")),
                 "impersonate": fp,
+                "approved": True,
+                "issue_token": True,
             }
 
         if _device_flow_error_kind(last_err) == "rate_limited":
@@ -575,15 +1008,15 @@ def validate_sso_cookie(
     timeout: int = 15,
     require_device_flow: bool = True,
     retries: int = 2,
+    issue_token: bool | None = None,
 ) -> dict[str, Any]:
     """
     校验换到的 sso 是否真正可导入上游。
 
-    默认 require_device_flow=True：走完整 OIDC device flow（与 import-sso 同路径）。
-    仅「能登录 accounts」不够——你之前 0/10 导入失败，就是 Docker 侧 TLS/并发问题 +
-    注册机只做了浅校验。
+    默认 require_device_flow=True：走 OIDC device flow（与 import-sso 同路径）。
+    issue_token 默认跟随 GROK_DEVICE_FLOW_ISSUE_TOKEN（默认 True，换到 access_token）。
 
-    返回: {ok, error, payload, token?}
+    返回: {ok, error, payload, token?, approved?}
     """
     del user_agent  # 保留签名兼容
     s = (sso or "").strip()
@@ -596,14 +1029,13 @@ def validate_sso_cookie(
         # 浅校验（不推荐用于记成功）
         payload = decode_jwt_payload(s)
         try:
-            sess = requests.Session()
-            sess.cookies.set("sso", s, domain=".x.ai")
+            sess = requests.Session(impersonate=impersonate or DEFAULT_IMPERSONATE)
+            sess.cookies.set("sso", s, domain=".x.ai", path="/")
             r = sess.get(
                 "https://accounts.x.ai/",
-                impersonate=impersonate or DEFAULT_IMPERSONATE,
                 timeout=timeout,
                 allow_redirects=True,
-                proxies=PROXIES or None,
+                **_proxy_kw(),
             )
             final_url = (r.url or "").lower()
             if "sign-in" in final_url or "sign-up" in final_url:
@@ -621,6 +1053,7 @@ def validate_sso_cookie(
             s,
             impersonate=None,  # 内部轮换稳妥指纹
             timeout=max(int(timeout or 20), 28),
+            issue_token=issue_token,
         )
         if result.get("ok"):
             return result
@@ -641,17 +1074,47 @@ def validate_sso_cookie(
     }
 
 
-def encode_grpc_message(field_id, string_value):
-    key = (field_id << 3) | 2
+def _protobuf_varint(n: int) -> bytes:
+    out = bytearray()
+    while n > 0x7F:
+        out.append((n & 0x7F) | 0x80)
+        n >>= 7
+    out.append(n & 0x7F)
+    return bytes(out)
+
+
+def encode_grpc_string_field(field_id: int, string_value: str) -> bytes:
+    """protobuf length-delimited string field (wire type 2)."""
     value_bytes = string_value.encode("utf-8")
-    length = len(value_bytes)
-    payload = struct.pack("B", key) + struct.pack("B", length) + value_bytes
+    key = (field_id << 3) | 2
+    return bytes([key]) + _protobuf_varint(len(value_bytes)) + value_bytes
+
+
+def encode_grpc_message(field_id, string_value):
+    """兼容旧调用：单 string 字段 + grpc-web 帧。"""
+    payload = encode_grpc_string_field(field_id, string_value)
+    return b"\x00" + struct.pack(">I", len(payload)) + payload
+
+
+def encode_create_email_validation_code(
+    email: str, castle_request_token: Optional[str] = None
+) -> bytes:
+    """
+    CreateEmailValidationCodeRequest:
+      string email = 1;
+      EmailTemplate email_template = 2;          # optional
+      optional string castle_request_token = 3;
+    """
+    parts = [encode_grpc_string_field(1, email)]
+    if castle_request_token is not None:
+        parts.append(encode_grpc_string_field(3, castle_request_token))
+    payload = b"".join(parts)
     return b"\x00" + struct.pack(">I", len(payload)) + payload
 
 
 def encode_grpc_message_verify(email, code):
-    p1 = struct.pack("B", (1 << 3) | 2) + struct.pack("B", len(email)) + email.encode("utf-8")
-    p2 = struct.pack("B", (2 << 3) | 2) + struct.pack("B", len(code)) + code.encode("utf-8")
+    p1 = encode_grpc_string_field(1, email)
+    p2 = encode_grpc_string_field(2, code)
     payload = p1 + p2
     return b"\x00" + struct.pack(">I", len(payload)) + payload
 
@@ -722,23 +1185,27 @@ class RegisterEngine:
         self._post_min_interval = 0.25
         self._last_post_start = 0.0
         # SSO 后的 device flow / 协议 / NSFW：后台跑，不堵下一号
-        self._enrich_workers = _enrich_worker_count()
+        # enrich 线程可多开，真正卡点在 device flow 信号量（默认 2）
         self._enrich_pool = concurrent.futures.ThreadPoolExecutor(
-            max_workers=self._enrich_workers, thread_name_prefix="RegEnrich"
+            max_workers=6, thread_name_prefix="RegEnrich"
         )
         self._enrich_pending = 0
-        self._nsfw_ok_count = 0
-        self._nsfw_fail_count = 0
         self._enrich_lock = threading.Lock()
 
         self.success_count = 0
         self.fail_count = 0
+        self.clean_count = 0
+        self.marked_count = 0
         self.target_count = 0
         self.workers = 0
         self.start_time: Optional[float] = None
         self.output_file: Optional[str] = None
         self.status = "idle"  # idle | initializing | running | stopping | done | error
         self.error_message = ""
+        # 默认同会话 CLEAN；可被 start(mode=) / GROK_REGISTER_MODE 覆盖
+        self.register_mode = resolve_register_mode()
+        self._ss_idx = 0
+        self._ss_idx_lock = threading.Lock()
         # 足够覆盖大批量注册；过小会导致「成功 100、可导入只剩 50」
         self.recent_success: deque = deque(maxlen=5000)
         self._log_fn = log_fn or (lambda msg, level="info": print(msg))
@@ -749,11 +1216,17 @@ class RegisterEngine:
             "state_tree": None,
             "ts": 0.0,
         }
-        self._action_cache_ttl = 6 * 3600  # 6 小时
+        # 页面发版后 server action id 会变；默认 30 分钟，可用 GROK_ACTION_CACHE_TTL 覆盖
+        self._action_cache_ttl = max(60, int(_ACTION_CACHE_TTL))
         self._load_action_cache_disk()
 
     def log(self, message: str, level: str = "info"):
         self._log_fn(message, level)
+
+    def _next_ss_idx(self) -> int:
+        with self._ss_idx_lock:
+            self._ss_idx += 1
+            return self._ss_idx
 
     def get_status(self) -> dict:
         elapsed = 0.0
@@ -769,8 +1242,11 @@ class RegisterEngine:
             "status": self.status,
             "success_count": self.success_count,
             "fail_count": self.fail_count,
+            "clean_count": int(getattr(self, "clean_count", 0) or 0),
+            "marked_count": int(getattr(self, "marked_count", 0) or 0),
             "target_count": self.target_count,
             "workers": self.workers,
+            "register_mode": getattr(self, "register_mode", None) or resolve_register_mode(),
             "elapsed": round(elapsed, 1),
             "avg_seconds": round(avg, 1),
             "progress": round(progress, 1),
@@ -779,13 +1255,10 @@ class RegisterEngine:
             "site_key": self.config.get("site_key") or "",
             "error_message": self.error_message,
             "enrich_pending": int(getattr(self, "_enrich_pending", 0) or 0),
-            "enrich_workers": int(getattr(self, "_enrich_workers", 0) or 0),
-            # NSFW 后台进度：完成=成功+失败，剩余=还在 enrich 队列/执行中
-            "nsfw_ok_count": int(getattr(self, "_nsfw_ok_count", 0) or 0),
-            "nsfw_fail_count": int(getattr(self, "_nsfw_fail_count", 0) or 0),
-            "nsfw_done_count": int(
-                (getattr(self, "_nsfw_ok_count", 0) or 0)
-                + (getattr(self, "_nsfw_fail_count", 0) or 0)
+            "token_ready_count": sum(
+                1
+                for it in self.recent_success
+                if is_auth_token_usable(it.get("auth_token"))
             ),
             # 不把完整 sso / token 暴露给前端轮询；导入走服务端 id 匹配
             "recent_success": [
@@ -796,6 +1269,7 @@ class RegisterEngine:
                     "sso": bool(it.get("sso")),  # 仅布尔，表示可导入
                     "has_token": is_auth_token_usable(it.get("auth_token")),
                     "nsfw": it.get("nsfw"),
+                    "clean": it.get("clean"),
                     "time": it.get("time"),
                     "imported": bool(it.get("imported")),
                 }
@@ -862,55 +1336,81 @@ class RegisterEngine:
 
     def initialize(self, force_rescan: bool = False) -> bool:
         self.status = "initializing"
+        mode = resolve_register_mode(getattr(self, "register_mode", None))
+        self.register_mode = mode
+        # 同会话 CLEAN 路径不依赖 Next.js Server Action ID（页内 fetch 自取）
+        if mode == "same_session":
+            if not self.config.get("site_key"):
+                self.config["site_key"] = "0x4AAAAAAAhr9JGVDZbrZOo0"
+            # 尽量用缓存 action_id（不强制）；没有也不阻塞
+            self._apply_action_cache()
+            self.log(
+                "路径=same_session（同页 castle mint + 页内 fetch · CLEAN 主路径）",
+                "success",
+            )
+            self.log(
+                f"代理={_ss_local_proxy_spec()} · Turnstile 并行预解 · camoufox",
+                "info",
+            )
+            return True
+
+        self.log("路径=protocol（旧混合协议，拆会话 castle 易 deny）", "warn")
         # 优先用缓存，启动几乎立刻进入注册
         if not force_rescan and self._apply_action_cache():
             aid = self.config["action_id"] or ""
             self.log(
-                f"使用缓存 Action ID: {aid[:18]}…（跳过页面扫描，秒开）",
+                f"使用缓存 Action ID: {aid[:18]}…（TTL {self._action_cache_ttl // 60}m，"
+                f"过期会自动跟页面版本）",
                 "success",
             )
             return True
 
         self.log(
-            "正在初始化：扫描 accounts.x.ai 页面提取 Action ID（仅首次/缓存过期，约 5~20 秒）…",
+            "正在初始化：扫描 accounts.x.ai/sign-up 提取当前页面 Server Action ID…",
             "info",
         )
         t0 = time.time()
         start_url = f"{self.site_url}/sign-up"
+        proxy_kw = _proxy_kw()
         with requests.Session(impersonate=DEFAULT_IMPERSONATE) as s:
             try:
-                html = s.get(start_url, timeout=20).text
+                html = s.get(start_url, timeout=20, **proxy_kw).text
                 key_match = re.search(r'sitekey":"(0x4[a-zA-Z0-9_-]+)"', html)
                 if key_match:
                     self.config["site_key"] = key_match.group(1)
-                tree_match = re.search(r'next-router-state-tree":"([^"]+)"', html)
-                if tree_match:
+                # 优先 next-router-state-tree；部分构建写在 flight 里
+                tree_match = re.search(
+                    r'next-router-state-tree":"([^"]+)"', html
+                ) or re.search(
+                    r'"children":\["sign-up"', html
+                )
+                if tree_match and hasattr(tree_match, "group") and tree_match.lastindex:
                     self.config["state_tree"] = tree_match.group(1)
                 soup = BeautifulSoup(html, "html.parser")
                 js_urls = [
                     urljoin(start_url, script["src"])
                     for script in soup.find_all("script", src=True)
-                    if "_next/static" in script["src"]
+                    if "_next/static" in script.get("src", "")
                 ]
-                # 优先扫体积较小的 chunk，命中后立刻停
-                found = False
-                for js_url in js_urls:
-                    try:
-                        js_content = s.get(js_url, timeout=15).text
-                    except Exception:
-                        continue
-                    match = re.search(r"7f[a-fA-F0-9]{40}", js_content)
-                    if match:
-                        self.config["action_id"] = match.group(0)
-                        cost = time.time() - t0
-                        self.log(
-                            f"Action ID: {self.config['action_id']}（扫描耗时 {cost:.1f}s，已写入缓存）",
-                            "success",
-                        )
-                        found = True
-                        break
-                if not found:
-                    self.config["action_id"] = None
+                # 1) HTML 内联 flight 也可能带 id
+                aid = _extract_signup_action_id(html)
+                # 2) 扫 JS chunk：优先 createServerReference(..., "default")
+                if not aid:
+                    for js_url in js_urls:
+                        try:
+                            js_content = s.get(js_url, timeout=15, **proxy_kw).text
+                        except Exception:
+                            continue
+                        aid = _extract_signup_action_id(js_content)
+                        if aid:
+                            break
+                self.config["action_id"] = aid
+                if aid:
+                    cost = time.time() - t0
+                    self.log(
+                        f"Action ID: {aid}（扫描耗时 {cost:.1f}s，已跟随当前页面版本）",
+                        "success",
+                    )
             except Exception as e:
                 self.error_message = f"初始化扫描失败: {e}"
                 self.log(self.error_message, "error")
@@ -918,16 +1418,17 @@ class RegisterEngine:
                 return False
 
         if not self.config["action_id"]:
-            self.error_message = "未找到 Action ID"
+            self.error_message = "未找到 Action ID（页面结构可能已变）"
             self.log(self.error_message, "error")
             self.status = "error"
             return False
         self._save_action_cache()
         return True
 
-    def send_email_code_grpc(self, session, email):
+    def send_email_code_grpc(self, session, email, castle_request_token: Optional[str] = None):
+        """协议发码。可选带 castle_request_token（field 3）。"""
         url = f"{self.site_url}/auth_mgmt.AuthManagement/CreateEmailValidationCode"
-        data = encode_grpc_message(1, email)
+        data = encode_create_email_validation_code(email, castle_request_token)
         headers = {
             "content-type": "application/grpc-web+proto",
             "x-grpc-web": "1",
@@ -937,7 +1438,24 @@ class RegisterEngine:
         }
         try:
             res = session.post(url, data=data, headers=headers, timeout=15)
-            return res.status_code == 200
+            # grpc-web: HTTP 200 + body trailer grpc-status:0 也算成功；
+            # 部分失败会在 header 带 grpc-status。
+            if res.status_code != 200:
+                return False
+            gs = res.headers.get("grpc-status") or res.headers.get("Grpc-Status")
+            if gs is not None and str(gs) not in ("0", ""):
+                return False
+            body = res.content or b""
+            if b"grpc-status:" in body and b"grpc-status:0" not in body:
+                # trailer 非 0
+                if b"grpc-status:0\r\n" not in body and b"grpc-status:0\n" not in body:
+                    # 可能只有非 0 status
+                    if b"grpc-status:" in body:
+                        # 粗判：出现 status 且不是 0
+                        text = body.decode("latin1", errors="replace")
+                        if "grpc-status:0" not in text:
+                            return False
+            return True
         except Exception as e:
             self.log(f"{email} 发送验证码异常: {e}", "error")
             return False
@@ -971,13 +1489,18 @@ class RegisterEngine:
         email: Optional[str],
         reason: str,
         level: str = "error",
+        *,
+        count_fail: bool = True,
     ) -> None:
         """
         单个账号失败：记失败、删邮箱、本账号结束。
         不置 stop_event，其它线程与后续账号继续跑到达目标。
         （同一邮箱不再换号死磕；新一轮会开新邮箱，属于新账号。）
+
+        count_fail=False：仅收尾（如 MARKED 已记 marked_count），避免和「失败尝试」重复加。
         """
-        self.fail_count += 1
+        if count_fail:
+            self.fail_count += 1
         self.error_message = reason
         self.log(f"{reason} — 本账号结束，任务继续", level)
         if email and email_service is not None:
@@ -1081,6 +1604,7 @@ class RegisterEngine:
                     "sso_preview": (sso[:18] + "...") if len(sso) > 18 else sso,
                     "auth_token": cached_token,
                     "nsfw": unhinged_ok,
+                    "clean": None,
                     "time": datetime.now().strftime("%H:%M:%S"),
                     "imported": False,
                 }
@@ -1110,9 +1634,10 @@ class RegisterEngine:
         *,
         auth_token: Optional[dict] = None,
         unhinged_ok: Optional[bool] = None,
+        clean: Optional[bool] = None,
         note: str = "",
     ) -> None:
-        """后台 enrich 完成后回填 token / NSFW 状态（按 id 匹配）。"""
+        """后台 enrich 完成后回填 token / NSFW / risk 状态（按 id 匹配）。"""
         if not success_id:
             return
         with self.file_lock:
@@ -1123,16 +1648,239 @@ class RegisterEngine:
                     item["auth_token"] = dict(auth_token)
                 if unhinged_ok is not None:
                     item["nsfw"] = bool(unhinged_ok)
-                    # 仅首次结算，避免重复回填双计
-                    if not item.get("_nsfw_counted"):
-                        item["_nsfw_counted"] = True
-                        if unhinged_ok:
-                            self._nsfw_ok_count += 1
-                        else:
-                            self._nsfw_fail_count += 1
+                if clean is not None:
+                    item["clean"] = bool(clean)
                 if note:
                     item["note"] = note
                 break
+
+    def _revoke_marked_success(
+        self,
+        success_id: str,
+        *,
+        email: str = "",
+        summary: str = "",
+    ) -> None:
+        """
+        MARKED 账号若已误入成功列表：踢出、回滚 success_count，禁止导入。
+        主路径应在 risk 通过后再 _record_success；本方法仅兜底。
+        """
+        if not success_id:
+            return
+        removed = False
+        with self.file_lock:
+            keep: deque = deque(maxlen=self.recent_success.maxlen)
+            for item in self.recent_success:
+                if item.get("id") == success_id:
+                    removed = True
+                    continue
+                keep.append(item)
+            if removed:
+                self.recent_success.clear()
+                self.recent_success.extend(keep)
+                if self.success_count > 0:
+                    self.success_count -= 1
+        if removed:
+            self.log(
+                f"{email or success_id} 已从成功列表移除（MARKED）"
+                + (f" · {summary}" if summary else ""),
+                "warn",
+            )
+
+    def _append_line(self, path: Path | str, line: str) -> None:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with self.file_lock:
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(line if line.endswith("\n") else line + "\n")
+
+    def _probe_and_mark_clean(
+        self,
+        *,
+        email: str,
+        sso: str,
+        sso_rw: str = "",
+        success_id: str = "",
+        proxy_spec: str = "",
+        foreground: bool = True,
+    ) -> Optional[bool]:
+        """
+        risk 探测：CLEAN 写 _clean.txt，MARKED 写 _marked.txt。
+        默认前台串行（foreground=True）——和注册同线程整号跑完再开下一号。
+        返回 True=CLEAN / False=MARKED / None=跳过或异常。
+        """
+        try:
+            if AntibotService is None:
+                self.log(f"{email} risk 跳过：AntibotService 不可用", "warn")
+                return None
+            # 探测走业务代理（与注册出口一致）
+            if proxy_spec:
+                url = ""
+                try:
+                    parsed = parse_proxy_spec(proxy_spec) or {}
+                    url = (
+                        parsed.get("server_url")
+                        or parsed.get("server")
+                        or ""
+                    )
+                except Exception:
+                    url = ""
+                if not url:
+                    raw = (proxy_spec or "").strip()
+                    if raw.startswith("http://") or raw.startswith("https://") or raw.startswith("socks"):
+                        url = raw
+                    elif raw:
+                        url = f"http://{raw}"
+                if url:
+                    os.environ["GROK_PROXY"] = url
+                    os.environ["XAI_PROXY"] = url
+            self.log(f"{email} risk 探测开始…", "info")
+            t0 = time.time()
+            ab = AntibotService()
+            # chrome124 经本地代理稳；chrome131 易 curl(35) OPENSSL invalid library
+            # probe 内部：多 impersonate + 代理失败后直连兜底
+            risk = ab.probe_account_risk(
+                sso, sso_rw=sso_rw or sso, impersonate="chrome124", timeout=20
+            )
+            # 仍基建失败：强制直连再打一轮（绕开 7897 TLS 抖动）
+            if AntibotService.is_risk_infra_error(risk):
+                self.log(
+                    f"{email} risk 基建抖动 · {AntibotService.risk_mark_summary(risk)[:80]} · 直连重试…",
+                    "warn",
+                )
+                time.sleep(0.4)
+                prev_force = os.environ.get("GROK_RISK_FORCE_DIRECT")
+                try:
+                    os.environ["GROK_RISK_FORCE_DIRECT"] = "1"
+                    risk = ab.probe_account_risk(
+                        sso,
+                        sso_rw=sso_rw or sso,
+                        impersonate="chrome124",
+                        timeout=25,
+                    )
+                finally:
+                    if prev_force is None:
+                        os.environ.pop("GROK_RISK_FORCE_DIRECT", None)
+                    else:
+                        os.environ["GROK_RISK_FORCE_DIRECT"] = prev_force
+            clean = bool(AntibotService.is_risk_clean(risk))
+            summary = AntibotService.risk_mark_summary(risk)
+            elapsed = round(time.time() - t0, 1)
+            if clean:
+                with self.file_lock:
+                    self.clean_count += 1
+                if self.output_file:
+                    clean_path = Path(self.output_file).with_name(
+                        Path(self.output_file).stem + "_clean.txt"
+                    )
+                    self._append_line(clean_path, f"{email}----{sso}")
+                if success_id:
+                    self._update_success_meta(
+                        success_id, clean=True, note=f"risk=CLEAN {summary}"
+                    )
+                self.log(
+                    f"{email} risk CLEAN · {summary} · {elapsed}s · "
+                    f"CLEAN累计 {self.clean_count}",
+                    "success",
+                )
+                return True
+            # TLS/代理基建失败：SSO 可能仍是好号，禁止记 MARKED、不进 _marked
+            if AntibotService.is_risk_infra_error(risk):
+                if self.output_file:
+                    infra_path = Path(self.output_file).with_name(
+                        Path(self.output_file).stem + "_infra_retry.txt"
+                    )
+                    self._append_line(infra_path, f"{email}----{sso}")
+                self.log(
+                    f"{email} risk INFRA（TLS/代理探测失败，非业务 MARKED）· "
+                    f"{summary} · {elapsed}s · SSO 已落 emergency，本号暂不进成功列表",
+                    "warn",
+                )
+                # None = 探测失败（非 MARKED），调用方按失败尝试处理，不叠 marked_count
+                return None
+            # 真 MARKED（DENIED / false_clean / botFlag）：落盘，不进成功/导入
+            with self.file_lock:
+                self.marked_count += 1
+            if self.output_file:
+                marked = Path(self.output_file).with_name(
+                    Path(self.output_file).stem + "_marked.txt"
+                )
+                self._append_line(marked, f"{email}----{sso}")
+                meta = Path(self.output_file).with_name(
+                    Path(self.output_file).stem + "_marked_meta.txt"
+                )
+                detail_bits = [
+                    summary,
+                    f"policy={risk.get('policy')}",
+                    f"event={risk.get('event')}",
+                    f"src={risk.get('bot_flag_source')}",
+                    f"score={risk.get('risk_score')}",
+                ]
+                self._append_line(
+                    meta, f"{email}\t" + " | ".join(str(x) for x in detail_bits if x)
+                )
+            if success_id:
+                # 若历史上已进成功列表，踢掉并回滚成功计数
+                self._revoke_marked_success(success_id, email=email, summary=summary)
+            self.log(
+                f"{email} risk MARKED · {summary} · {elapsed}s · "
+                f"绕过成功列表/导入 · MARKED累计 {self.marked_count}",
+                "warn",
+            )
+            return False
+        except Exception as e:
+            err_s = str(e)
+            # 外层异常若是 curl TLS，同样不当 MARKED
+            low = err_s.lower()
+            if any(
+                m in low
+                for m in (
+                    "curl: (35)",
+                    "tls connect",
+                    "openssl",
+                    "invalid library",
+                    "failed to perform",
+                )
+            ):
+                self.log(
+                    f"{email} risk 探测异常(INFRA): {err_s[:120]} · 非 MARKED",
+                    "warn",
+                )
+                return None
+            self.log(f"{email} risk 探测异常: {e}", "warn")
+            return None
+        finally:
+            # 仅后台调度时扣 pending；前台不走 enrich 计数
+            if not foreground:
+                with self._enrich_lock:
+                    self._enrich_pending = max(0, self._enrich_pending - 1)
+
+    def _schedule_risk_probe(
+        self,
+        *,
+        email: str,
+        sso: str,
+        sso_rw: str,
+        success_id: str,
+        proxy_spec: str = "",
+    ) -> None:
+        """兼容旧调用：后台 risk（same_session 已改前台，一般不再走这里）。"""
+        with self._enrich_lock:
+            self._enrich_pending += 1
+        try:
+            self._enrich_pool.submit(
+                self._probe_and_mark_clean,
+                email=email,
+                sso=sso,
+                sso_rw=sso_rw or "",
+                success_id=success_id,
+                proxy_spec=proxy_spec or "",
+                foreground=False,
+            )
+        except Exception as e:
+            with self._enrich_lock:
+                self._enrich_pending = max(0, self._enrich_pending - 1)
+            self.log(f"{email} 调度 risk 失败: {e}", "warn")
 
     def _throttle_signup_post(self) -> None:
         """注册 POST 起步节流：保证间隔，但不把整个 HTTP 锁死。"""
@@ -1143,6 +1891,89 @@ class RegisterEngine:
                 time.sleep(wait)
             self._last_post_start = time.time()
 
+    def _exchange_token_after_clean(
+        self,
+        *,
+        email: str,
+        sso: str,
+        success_id: str = "",
+        impersonate: str = "chrome131",
+        user_agent: str = "",
+        retries: int = 3,
+    ) -> Optional[dict]:
+        """
+        前台换 token：接在 risk 检测之后，作为正式流程一步。
+        成功则缓存到 recent_success，导入时优先直写，不再现换。
+        失败不改成功计数；导入侧仍可用 sso-to-oauth / 本机 device flow 兜底。
+        """
+        self.log(f"{email} 换 token 开始…", "info")
+        t0 = time.time()
+        try:
+            check = validate_sso_cookie(
+                sso,
+                impersonate=impersonate or "chrome131",
+                user_agent=user_agent or (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
+                ),
+                require_device_flow=True,
+                retries=max(1, int(retries or 3)),
+                timeout=28,
+                issue_token=True,
+            )
+            elapsed = round(time.time() - t0, 1)
+            if check.get("ok") and isinstance(check.get("token"), dict):
+                token = check.get("token")
+                if is_auth_token_usable(token):
+                    self._update_success_meta(
+                        success_id,
+                        auth_token=token,
+                        note=f"token=cached · device_flow=ok · {elapsed}s",
+                    )
+                    self.log(
+                        f"{email} 换 token 成功 · 已缓存 · {elapsed}s（导入可直写）",
+                        "success",
+                    )
+                    return token
+                self._update_success_meta(
+                    success_id,
+                    note=f"token=unusable · {elapsed}s",
+                )
+                self.log(
+                    f"{email} 换 token 返回体不可用 · {elapsed}s（导入走兜底）",
+                    "warn",
+                )
+                return None
+            if check.get("ok") and check.get("approved") and not check.get("token"):
+                self._update_success_meta(
+                    success_id,
+                    note=f"token=approved_no_body · {elapsed}s",
+                )
+                self.log(
+                    f"{email} 换 token：approve 成功但无 token 体 · {elapsed}s（导入兜底）",
+                    "warn",
+                )
+                return None
+            err = check.get("error") or "device flow 失败"
+            self._update_success_meta(
+                success_id,
+                note=f"token=fail · {str(err)[:60]} · {elapsed}s",
+            )
+            self.log(
+                f"{email} 换 token 失败 · {err} · {elapsed}s（导入走 sso-to-oauth/兜底）",
+                "warn",
+            )
+            return None
+        except Exception as e:
+            elapsed = round(time.time() - t0, 1)
+            self.log(f"{email} 换 token 异常 · {e} · {elapsed}s", "warn")
+            self._update_success_meta(
+                success_id,
+                note=f"token=exc · {str(e)[:60]}",
+            )
+            return None
+
     def _enrich_after_sso(
         self,
         *,
@@ -1152,11 +1983,13 @@ class RegisterEngine:
         success_id: str,
         impersonate: str,
         user_agent: str,
+        skip_token: bool = False,
     ) -> None:
         """
-        SSO 已落盘并计成功后的锦上添花：
-        device flow 缓存 token + 协议/NSFW。
-        失败不影响成功计数；导入时仍可再走 device flow。
+        SSO 后收尾：
+        - skip_token=True（默认 same_session 前台已换票）：只做协议/NSFW
+        - skip_token=False：兼容旧路径，后台先换 token 再 NSFW
+        失败不影响成功计数。导入换票仅兜底，主路径应已有缓存 token。
         """
         try:
             user_agreement_service = UserAgreementService()
@@ -1164,32 +1997,42 @@ class RegisterEngine:
             note_parts: list[str] = []
             auth_token = None
 
-            # 短超时 + 少重试：抢不到就留给导入阶段，别堵 enrich 池
-            check = validate_sso_cookie(
-                sso,
-                impersonate=impersonate,
-                user_agent=user_agent,
-                require_device_flow=True,
-                retries=2,
-                timeout=20,
-            )
-            if check.get("ok") and isinstance(check.get("token"), dict):
-                auth_token = check.get("token")
-                note_parts.append("device_flow=ok+token_cached")
-                self.log(
-                    f"{email} [后台] device flow 通过，token 已缓存",
-                    "success",
+            if not skip_token:
+                # 旧路径 / 未前台换票时：后台 device flow
+                check = validate_sso_cookie(
+                    sso,
+                    impersonate=impersonate,
+                    user_agent=user_agent,
+                    require_device_flow=True,
+                    retries=3,
+                    timeout=28,
+                    issue_token=True,
                 )
-            elif check.get("ok"):
-                note_parts.append("device_flow=ok")
-                self.log(f"{email} [后台] device flow 通过（无 token 体）", "info")
+                if check.get("ok") and isinstance(check.get("token"), dict):
+                    auth_token = check.get("token")
+                    note_parts.append("device_flow=ok+token_cached")
+                    self.log(
+                        f"{email} [后台] device flow 通过，token 已缓存",
+                        "success",
+                    )
+                elif check.get("ok") and check.get("approved") and not check.get("token"):
+                    note_parts.append("device_flow=approved_no_token")
+                    self.log(
+                        f"{email} [后台] approve 成功但未拿到 token，导入时兜底再换",
+                        "warn",
+                    )
+                elif check.get("ok"):
+                    note_parts.append("device_flow=ok")
+                    self.log(f"{email} [后台] device flow 通过（无 token 体）", "info")
+                else:
+                    err = check.get("error") or "device flow 失败"
+                    note_parts.append(f"device_flow_pending: {str(err)[:60]}")
+                    self.log(
+                        f"{email} [后台] device flow 未通过（{err}），导入时兜底再换",
+                        "warn",
+                    )
             else:
-                err = check.get("error") or "device flow 失败"
-                note_parts.append(f"device_flow_pending: {str(err)[:60]}")
-                self.log(
-                    f"{email} [后台] device flow 未通过（{err}），导入时再换",
-                    "warn",
-                )
+                note_parts.append("token=foreground_done")
 
             unhinged_ok = False
             try:
@@ -1251,6 +2094,7 @@ class RegisterEngine:
         success_id: str,
         impersonate: str,
         user_agent: str,
+        skip_token: bool = False,
     ) -> None:
         with self._enrich_lock:
             self._enrich_pending += 1
@@ -1263,11 +2107,313 @@ class RegisterEngine:
                 success_id=success_id,
                 impersonate=impersonate,
                 user_agent=user_agent,
+                skip_token=skip_token,
             )
         except Exception as e:
             with self._enrich_lock:
                 self._enrich_pending = max(0, self._enrich_pending - 1)
             self.log(f"{email} 调度后台 enrich 失败: {e}", "warn")
+
+    def register_single_thread_same_session(self):
+        """
+        CLEAN 主路径：同页 fiber mint castle + 页内 fetch 发码/验码/signup。
+        对齐 standalone_same_session_n；禁止拆会话 mint 再外层 curl。
+        """
+        if self.workers > 1:
+            if self._sleep(random.uniform(0, min(1.2, 0.12 * self.workers))):
+                return
+
+        try:
+            email_service = EmailService()
+            turnstile_service = TurnstileService()
+        except Exception as e:
+            self.log(f"服务初始化失败: {e}", "error")
+            self.stop_event.set()
+            return
+
+        site_key = self.config.get("site_key") or "0x4AAAAAAAhr9JGVDZbrZOo0"
+        proxy_spec_str = _ss_local_proxy_spec()
+        current_email = None
+
+        while not self.stop_event.is_set() and self.success_count < self.target_count:
+            idx = self._next_ss_idx()
+            fp = _ss_pick_fp(idx)
+            email = None
+            try:
+                # Solver 不在线不建邮
+                if not (turnstile_service.yescaptcha_key or "").strip():
+                    try:
+                        turnstile_service._ensure_local_solver(stop_event=self.stop_event)
+                    except RuntimeError as te:
+                        if str(te) == "stopped" or self.stop_event.is_set():
+                            return
+                        self.log(f"Solver 未就绪: {te}，等待后重试（未创建邮箱）", "warn")
+                        if self._sleep(3):
+                            return
+                        continue
+                    except Exception as se:
+                        if self.stop_event.is_set():
+                            return
+                        self.log(f"Solver 未就绪: {se}，等待后重试", "warn")
+                        if self._sleep(5):
+                            return
+                        continue
+
+                # Turnstile 预解与建邮/浏览器重叠
+                ts_pre: dict[str, Any] = {
+                    "token": None,
+                    "error": None,
+                    "t0": time.time(),
+                    "done": threading.Event(),
+                    "used": False,
+                }
+
+                def _ts_prewarm() -> None:
+                    try:
+                        task_id = turnstile_service.create_task(
+                            self.site_url, site_key, stop_event=self.stop_event
+                        )
+                        tok = turnstile_service.get_response(
+                            task_id, stop_event=self.stop_event
+                        )
+                        ts_pre["token"] = tok
+                        if not tok or tok == "CAPTCHA_FAIL":
+                            ts_pre["error"] = turnstile_service.last_error or "empty"
+                    except Exception as e:
+                        ts_pre["error"] = str(e)
+                    finally:
+                        ts_pre["done"].set()
+
+                threading.Thread(
+                    target=_ts_prewarm, daemon=True, name=f"ss-ts-{idx}"
+                ).start()
+
+                try:
+                    _jwt, email = email_service.create_email()
+                    current_email = email
+                except Exception as e:
+                    self._fail_account(email_service, None, f"邮箱服务异常: {e}")
+                    if self._sleep(2):
+                        return
+                    continue
+                if not email:
+                    self._fail_account(email_service, None, "创建邮箱失败")
+                    if self._sleep(1):
+                        return
+                    continue
+                if self.stop_event.is_set():
+                    try:
+                        email_service.delete_email(email)
+                    except Exception:
+                        pass
+                    return
+
+                password = generate_random_string(14)
+                given = generate_random_name()
+                family = generate_random_name()
+                self.log(
+                    f"开始注册[same_session]: {email} · {fp['tag']}/{fp['fp_os']}/{fp['timing']}",
+                    "info",
+                )
+
+                def fetch_code(em: str):
+                    return email_service.fetch_verification_code(
+                        em, stop_event=self.stop_event
+                    )
+
+                def solve_ts(sk: str):
+                    if not ts_pre["done"].is_set():
+                        remain = max(1.0, 90.0 - (time.time() - float(ts_pre["t0"])))
+                        ts_pre["done"].wait(timeout=remain)
+                    tok = ts_pre.get("token")
+                    if tok and tok != "CAPTCHA_FAIL" and not ts_pre["used"]:
+                        ts_pre["used"] = True
+                        return tok
+                    task_id = turnstile_service.create_task(
+                        self.site_url, sk or site_key, stop_event=self.stop_event
+                    )
+                    return turnstile_service.get_response(
+                        task_id, stop_event=self.stop_event
+                    )
+
+                pre_token = None
+                if ts_pre["done"].is_set():
+                    t = ts_pre.get("token")
+                    if t and t != "CAPTCHA_FAIL":
+                        pre_token = t
+                        ts_pre["used"] = True
+
+                def _ss_log(msg: str, level: str = "info") -> None:
+                    # same_session_register 回调只有 msg；级别固定 info
+                    self.log(f"{email} {msg}", level if level in ("info", "warn", "error", "success") else "info")
+
+                # same_session_register 的 log 只收 msg
+                def _ss_log_msg(msg: str) -> None:
+                    self.log(f"{email} {msg}", "info")
+
+                ss = same_session_register(
+                    email=email,
+                    password=password,
+                    given_name=given,
+                    family_name=family,
+                    fetch_code=fetch_code,
+                    turnstile_token=pre_token,
+                    solve_turnstile=solve_ts,
+                    headless=None,
+                    browser="camoufox",
+                    proxy=proxy_spec_str,
+                    locale=fp["locale"],
+                    timezone_id=fp["timezone"],
+                    fp_os=fp["fp_os"],
+                    timing=fp["timing"],
+                    viewport=fp["viewport"],
+                    humanize=fp.get("humanize", False),
+                    log=_ss_log_msg,
+                )
+
+                if self.stop_event.is_set():
+                    try:
+                        email_service.delete_email(email)
+                    except Exception:
+                        pass
+                    return
+
+                if not ss.get("ok"):
+                    err = ss.get("error") or "same_session failed"
+                    self._fail_account(
+                        email_service, email, f"{email} same_session 失败: {err}"
+                    )
+                    current_email = None
+                    if self._sleep(0.3):
+                        return
+                    continue
+
+                sso = (ss.get("sso") or "").strip()
+                sso_rw = (ss.get("sso_rw") or sso or "").strip()
+                if not sso:
+                    self._fail_account(
+                        email_service, email, f"{email} same_session 无 sso"
+                    )
+                    current_email = None
+                    continue
+
+                castle_len = ss.get("castle_len") or 0
+                castle_method = ss.get("castle_method") or ""
+                steps_tail = ""
+                try:
+                    steps = ss.get("steps") or []
+                    if isinstance(steps, list) and steps:
+                        steps_tail = " · " + " > ".join(str(x) for x in steps[-6:])
+                except Exception:
+                    steps_tail = ""
+                self.log(
+                    f"{email} same_session SSO 到手 · castle={castle_len}"
+                    f"/{castle_method}{steps_tail} · 先 risk 再决定是否计成功",
+                    "info",
+                )
+                # 仅 forensic 紧急盘，不写主成功文件、不进成功列表
+                # （MARKED 会被绕过，绝不进 recent_success / 不导入）
+                try:
+                    emergency = _BASE_DIR / "keys" / "emergency_sso.txt"
+                    emergency.parent.mkdir(parents=True, exist_ok=True)
+                    with self.file_lock:
+                        with open(emergency, "a", encoding="utf-8") as f:
+                            f.write(f"{email}----{sso}\n")
+                except Exception:
+                    pass
+
+                # 前台 risk 门禁：只有 CLEAN 才计成功 / 换 token / 可导入
+                clean = self._probe_and_mark_clean(
+                    email=email,
+                    sso=sso,
+                    sso_rw=sso_rw,
+                    success_id="",
+                    proxy_spec=proxy_spec_str,
+                    foreground=True,
+                )
+                if clean is not True:
+                    # MARKED / 探测失败：已写 _marked，不进成功列表、不换票、不入库
+                    # MARKED 只记 marked_count，不再叠 fail_count（避免「目标5却失败7」误解）
+                    if clean is False:
+                        reason = (
+                            f"{email} risk MARKED，绕过成功列表与导入"
+                            f"（MARKED 累计 {getattr(self, 'marked_count', 0)}）"
+                        )
+                        self._fail_account(
+                            email_service,
+                            email,
+                            reason,
+                            level="warn",
+                            count_fail=False,
+                        )
+                    else:
+                        reason = f"{email} risk 探测失败，绕过成功列表与导入"
+                        self._fail_account(
+                            email_service, email, reason, level="warn"
+                        )
+                    current_email = None
+                    if self._sleep(0.2):
+                        return
+                    continue
+
+                # —— 仅 CLEAN 路径 ——
+                ua = (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
+                )
+                sid = self._record_success(
+                    email=email,
+                    sso=sso,
+                    unhinged_ok=False,
+                    email_service=email_service,
+                    note=(
+                        f"mode=same_session castle={castle_len} "
+                        f"method={castle_method} risk=CLEAN"
+                    ),
+                    already_written=False,
+                    auth_token=None,
+                )
+                if sid:
+                    self._update_success_meta(
+                        sid, clean=True, note="risk=CLEAN · token=pending"
+                    )
+                    self._exchange_token_after_clean(
+                        email=email,
+                        sso=sso,
+                        success_id=sid,
+                        impersonate="chrome131",
+                        user_agent=ua,
+                    )
+                    # 协议/NSFW 仍后台；token 已前台换过
+                    self._schedule_enrich(
+                        email=email,
+                        sso=sso,
+                        sso_rw=sso_rw,
+                        success_id=sid,
+                        impersonate="chrome131",
+                        user_agent=ua,
+                        skip_token=True,
+                    )
+                current_email = None
+                continue
+            except Exception as e:
+                if self.stop_event.is_set():
+                    if current_email:
+                        try:
+                            email_service.delete_email(current_email)
+                        except Exception:
+                            pass
+                    return
+                self._fail_account(
+                    email_service,
+                    current_email,
+                    f"same_session 异常: {str(e)[:120]}",
+                )
+                current_email = None
+                if self._sleep(1):
+                    return
+                continue
 
     def register_single_thread(self):
         # 多线程时轻微错开，单线程几乎立刻开跑
@@ -1278,6 +2424,7 @@ class RegisterEngine:
         try:
             email_service = EmailService()
             turnstile_service = TurnstileService()
+            castle_service = CastleService()
             # 协议/NSFW 已挪到后台 enrich 池，主线程不再初始化
         except Exception as e:
             self.log(f"服务初始化失败: {e}", "error")
@@ -1356,7 +2503,41 @@ class RegisterEngine:
 
                     self.log(f"开始注册: {email}", "info")
 
-                    if not self.send_email_code_grpc(session, email):
+                    # 架构：发码/验码/注册 = 纯协议；Turnstile = Camoufox 无头 Solver
+                    # Castle 产线 G6 尚未纯协议还原，默认 Camoufox 无头 mint（CASTLE_MODE=skip 可关）
+                    castle_token = None
+                    if castle_service.mode not in ("skip", "none", "off", "0", "false"):
+                        self.log(
+                            f"{email} Castle mint（Camoufox 无头，mode={castle_service.mode}）…",
+                            "info",
+                        )
+                        try:
+                            castle_token = castle_service.mint(stop_event=self.stop_event)
+                        except Exception as ce:
+                            self.log(f"{email} Castle mint 异常: {ce}", "warn")
+                            castle_token = None
+                        if castle_token:
+                            self.log(
+                                f"{email} Castle OK len={len(castle_token)} head={castle_token[:28]}…",
+                                "info",
+                            )
+                        else:
+                            self.log(
+                                f"{email} Castle 未拿到（{castle_service.last_error or 'empty'}），"
+                                f"发码/注册将不带或空带 castle",
+                                "warn",
+                            )
+                    if self.stop_event.is_set():
+                        try:
+                            email_service.delete_email(email)
+                        except Exception:
+                            pass
+                        current_email = None
+                        return
+
+                    if not self.send_email_code_grpc(
+                        session, email, castle_request_token=castle_token
+                    ):
                         self._fail_account(
                             email_service, email, f"{email} 发送邮箱验证码失败"
                         )
@@ -1460,7 +2641,24 @@ class RegisterEngine:
                                 return
                             continue
 
-                        self.log(f"{email} Turnstile 成功，提交注册…", "info")
+                        # 终态前尽量刷新 castle（token 有时效）；失败则复用发码时的
+                        signup_castle = castle_token
+                        if castle_service.mode not in ("skip", "none", "off", "0", "false"):
+                            try:
+                                fresh = castle_service.mint(stop_event=self.stop_event)
+                                if fresh:
+                                    signup_castle = fresh
+                                    self.log(
+                                        f"{email} 终态 Castle 刷新 OK len={len(fresh)}",
+                                        "info",
+                                    )
+                            except Exception as ce:
+                                self.log(
+                                    f"{email} 终态 Castle 刷新失败，复用旧 token: {ce}",
+                                    "warn",
+                                )
+
+                        self.log(f"{email} Turnstile 成功，提交注册（协议）…", "info")
                         headers = {
                             "user-agent": account_user_agent,
                             "accept": "text/x-component",
@@ -1471,20 +2669,22 @@ class RegisterEngine:
                             "next-router-state-tree": self.config["state_tree"],
                             "next-action": final_action_id,
                         }
-                        payload = [
-                            {
-                                "emailValidationCode": verify_code,
-                                "createUserAndSessionRequest": {
-                                    "email": email,
-                                    "givenName": generate_random_name(),
-                                    "familyName": generate_random_name(),
-                                    "clearTextPassword": password,
-                                    "tosAcceptedVersion": "$undefined",
-                                },
-                                "turnstileToken": token,
-                                "promptOnDuplicateEmail": True,
-                            }
-                        ]
+                        body_obj = {
+                            "emailValidationCode": verify_code,
+                            "createUserAndSessionRequest": {
+                                "email": email,
+                                "givenName": generate_random_name(),
+                                "familyName": generate_random_name(),
+                                "clearTextPassword": password,
+                                "tosAcceptedVersion": "$undefined",
+                            },
+                            "turnstileToken": token,
+                            "conversionId": str(uuid.uuid4()),
+                            "promptOnDuplicateEmail": True,
+                        }
+                        if signup_castle:
+                            body_obj["castleRequestToken"] = signup_castle
+                        payload = [body_obj]
 
                         try:
                             # 仅起步节流，HTTP 本身并行，避免 8 线程全卡在一把锁上
@@ -1650,15 +2850,21 @@ class RegisterEngine:
                 self.log("任务已取消（初始化后停止）", "warn")
                 return
             self.status = "running"
+            mode = resolve_register_mode(getattr(self, "register_mode", None))
+            self.register_mode = mode
+            worker_fn = (
+                self.register_single_thread_same_session
+                if mode == "same_session"
+                else self.register_single_thread
+            )
             self.log(
-                f"启动 {workers} 个注册线程，目标 {self.target_count} 个"
-                f"（后台 enrich {self._enrich_workers} 线程）",
+                f"启动 {workers} 个线程，目标 {self.target_count} 个 · 路径={mode}",
                 "info",
             )
             self.log(f"输出: {self.output_file}", "info")
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
                 self._executor = executor
-                futures = [executor.submit(self.register_single_thread) for _ in range(workers)]
+                futures = [executor.submit(worker_fn) for _ in range(workers)]
                 # 周期检查 stop，避免 wait 一直挂到所有线程自然结束才有反馈
                 while True:
                     done, _not_done = concurrent.futures.wait(
@@ -1671,37 +2877,78 @@ class RegisterEngine:
                         concurrent.futures.wait(futures, timeout=6)
                         break
             self._executor = None
-            # 等后台 enrich 收尾一会儿（最多 ~20s），避免刚停任务 token 还没回填
+            # 等后台 NSFW/协议收尾（最多 ~45s）
             try:
-                deadline = time.time() + 20.0
+                deadline = time.time() + 45.0
                 while time.time() < deadline:
                     with self._enrich_lock:
                         pending = self._enrich_pending
                     if pending <= 0:
                         break
-                    time.sleep(0.4)
+                    time.sleep(0.5)
                 with self._enrich_lock:
                     left = self._enrich_pending
+                # 统计时：有可用 token 或已导入都算「票已就绪」（导入后会清内存 token）
+                token_ready = 0
+                imported_n = 0
+                for it in list(self.recent_success):
+                    if it.get("imported"):
+                        imported_n += 1
+                        token_ready += 1
+                    elif is_auth_token_usable(it.get("auth_token")):
+                        token_ready += 1
                 if left > 0:
                     self.log(
-                        f"仍有 {left} 个后台 enrich 未完成（device flow/协议），"
-                        f"不影响已落盘 SSO；导入时可再换 token",
+                        f"仍有 {left} 个后台 NSFW/协议未完成；token/已导入 "
+                        f"{token_ready}/{self.success_count}（其中已导入 {imported_n}）",
                         "warn",
+                    )
+                else:
+                    self.log(
+                        f"流水线收尾：token/已导入 {token_ready}/{self.success_count}"
+                        f"（已导入 {imported_n}；缺票才走 sso-to-oauth/兜底）",
+                        "success" if token_ready else "warn",
                     )
             except Exception:
                 pass
+            # same_session：自动入库（优先 recent_success 缓存 token；已导入则跳过）
+            if resolve_register_mode(getattr(self, "register_mode", None)) == "same_session":
+                try:
+                    self._auto_import_clean_accounts()
+                except Exception as ie:
+                    self.log(f"自动入库异常: {ie}", "warn")
+            # same_session 浏览器池收尾
+            if resolve_register_mode(getattr(self, "register_mode", None)) == "same_session":
+                try:
+                    from g.same_session_register import shutdown_camoufox_pool
+
+                    shutdown_camoufox_pool()
+                except Exception:
+                    pass
             if self.status == "error":
                 pass
             elif self.stop_event.is_set() and self.success_count < self.target_count:
                 self.status = "done"
                 self.log(
-                    f"任务已停止：成功 {self.success_count}/{self.target_count}，失败尝试 {self.fail_count}",
+                    f"任务已停止：CLEAN成功 {self.success_count}/{self.target_count}，"
+                    f"过程失败 {self.fail_count}，MARKED {getattr(self, 'marked_count', 0)}"
+                    f"（目标只计成功，失败/MARKED 是废号尝试，不是多要了码）",
                     "warn",
                 )
             else:
                 self.status = "done"
+                # 口径：目标=CLEAN成功数；过程失败=注册链路挂掉；MARKED=风控废号（另计）
+                attempts = (
+                    int(self.success_count)
+                    + int(self.fail_count)
+                    + int(getattr(self, "marked_count", 0) or 0)
+                )
                 self.log(
-                    f"任务结束：成功 {self.success_count}/{self.target_count}，失败尝试 {self.fail_count}",
+                    f"任务结束：CLEAN成功 {self.success_count}/{self.target_count}"
+                    f"（目标达成）· 过程失败 {self.fail_count}"
+                    f"· MARKED {getattr(self, 'marked_count', 0)}"
+                    f"· 总尝试约 {attempts}"
+                    f"（失败/MARKED 是废号，不是额外目标）",
                     "success" if self.success_count else "warn",
                 )
         except Exception as e:
@@ -1720,6 +2967,117 @@ class RegisterEngine:
             except Exception:
                 pass
 
+    def _auto_import_clean_accounts(self) -> None:
+        """
+        任务收尾自动入库：
+        1) 优先 recent_success 里未导入且有缓存 token 的 CLEAN 号（直写）
+        2) 若内存已全部 imported，跳过（避免再读 clean 文件走 sso-to-oauth 二次导入）
+        3) 仅当内存空/缺票时，才回落 _clean.txt
+        """
+        from g.auto_import import auto_import_enabled
+
+        if not auto_import_enabled():
+            self.log("自动入库已关闭（AUTO_IMPORT=0）", "info")
+            return
+
+        pending = [
+            it
+            for it in list(self.recent_success)
+            if it.get("sso")
+            and not it.get("imported")
+            and (it.get("clean") is True or it.get("clean") is None)
+        ]
+        already = sum(1 for it in list(self.recent_success) if it.get("imported"))
+        if not pending and already > 0:
+            self.log(
+                f"自动入库跳过：{already} 条已在任务内直写导入，无需再读 clean 文件",
+                "success",
+            )
+            return
+
+        if pending:
+            try:
+                from app import import_sso_to_upstream
+            except Exception as e:
+                self.log(f"自动入库失败：无法加载导入模块 · {e}", "error")
+                return
+            accounts = []
+            seen = set()
+            for it in pending:
+                sso = (it.get("sso") or "").strip()
+                if not sso or sso in seen:
+                    continue
+                seen.add(sso)
+                tok = it.get("auth_token")
+                accounts.append(
+                    {
+                        "email": (it.get("email") or "").strip(),
+                        "sso": sso,
+                        "auth_token": tok if isinstance(tok, dict) else None,
+                    }
+                )
+            if not accounts:
+                self.log("自动入库跳过：无可提交账号", "warn")
+                return
+            cached_n = sum(
+                1 for a in accounts if is_auth_token_usable(a.get("auth_token"))
+            )
+            self.log(
+                f"自动入库开始 · recent_success {len(accounts)} 条"
+                f"（缓存 token {cached_n}）",
+                "info",
+            )
+            result = import_sso_to_upstream(
+                accounts=accounts, merge=True, max_workers=1
+            )
+            # 标记已导入，清内存 token（与 app._mark_recent_imported 对齐）
+            ok_emails = set()
+            for row in result.get("results") or []:
+                if row.get("status") == "ok" and row.get("email"):
+                    ok_emails.add(str(row["email"]).lower())
+            if result.get("ok") or (result.get("success") or 0) > 0:
+                for it in self.recent_success:
+                    em = (it.get("email") or "").lower()
+                    if em and em in ok_emails:
+                        it["imported"] = True
+                        it["auth_token"] = None
+                    elif result.get("ok") and it in pending:
+                        it["imported"] = True
+                        it["auth_token"] = None
+            success = int(result.get("success") or 0)
+            fail = int(result.get("fail") or 0)
+            msg = result.get("message") or ""
+            level = (
+                "success"
+                if success > 0 and fail == 0
+                else ("warn" if success > 0 else "error")
+            )
+            self.log(
+                f"自动入库完成 · 成功 {success}/{len(accounts)} · 失败 {fail} · {msg}",
+                level,
+            )
+            return
+
+        # 回落：内存无账号时读 clean 文件（例如仅 CLI 跑完、或 recent 被清）
+        if not self.output_file:
+            self.log("自动入库跳过：无 output 与 recent", "warn")
+            return
+        try:
+            from g.auto_import import import_clean_file
+
+            clean_file = Path(self.output_file).with_name(
+                Path(self.output_file).stem + "_clean.txt"
+            )
+            if clean_file.is_file() and clean_file.stat().st_size > 0:
+                import_clean_file(
+                    clean_file,
+                    log=lambda msg, level="info": self.log(msg, level),
+                )
+            else:
+                self.log("无 CLEAN 文件，跳过自动入库", "warn")
+        except Exception as ie:
+            self.log(f"自动入库（文件回落）异常: {ie}", "warn")
+
     def stop(self) -> dict:
         if not self.is_running():
             return {"ok": False, "message": "当前没有运行中的任务", **self.get_status()}
@@ -1728,7 +3086,13 @@ class RegisterEngine:
         self.log("正在停止任务（等待当前网络请求结束，最多约数秒）…", "warn")
         return {"ok": True, "message": "已发送停止信号", **self.get_status()}
 
-    def start(self, workers: int = 8, target: int = 100, blocking: bool = False) -> dict:
+    def start(
+        self,
+        workers: int = 8,
+        target: int = 100,
+        blocking: bool = False,
+        mode: Optional[str] = None,
+    ) -> dict:
         with self._run_lock:
             # 线程还没跑到 initialize 时 status 也要立刻占位，防止重复启动
             if self.is_running() or (
@@ -1738,19 +3102,32 @@ class RegisterEngine:
 
             workers = max(1, min(int(workers), 64))
             target = max(1, int(target))
+            # same_session 吃浏览器资源，默认压并发上限
+            reg_mode = resolve_register_mode(
+                mode if mode is not None else os.environ.get("GROK_REGISTER_MODE")
+            )
+            if reg_mode == "same_session":
+                max_ss = int(os.environ.get("GROK_SS_MAX_WORKERS") or "4")
+                max_ss = max(1, min(max_ss, 16))
+                if workers > max_ss:
+                    self.log(
+                        f"same_session 并发 {workers}→{max_ss}（GROK_SS_MAX_WORKERS，防浏览器打爆）",
+                        "warn",
+                    )
+                    workers = max_ss
 
             self.stop_event.clear()
             self.success_count = 0
             self.fail_count = 0
+            self.clean_count = 0
+            self.marked_count = 0
             self.target_count = target
             self.workers = workers
+            self.register_mode = reg_mode
+            self._ss_idx = 0
             self.start_time = time.time()
             self.error_message = ""
             self.recent_success.clear()
-            with self._enrich_lock:
-                self._enrich_pending = 0
-                self._nsfw_ok_count = 0
-                self._nsfw_fail_count = 0
             # 先标 initializing，避免并发 /api/start 重复拉起
             self.status = "initializing"
             # 不清空缓存的 action_id；initialize 会优先用缓存
@@ -1759,7 +3136,8 @@ class RegisterEngine:
 
             os.makedirs("keys", exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.output_file = f"keys/grok_{timestamp}_{target}.txt"
+            prefix = "grok_ss" if reg_mode == "same_session" else "grok"
+            self.output_file = f"keys/{prefix}_{timestamp}_{target}.txt"
 
             if blocking:
                 self._run_workers(workers)
@@ -1772,7 +3150,11 @@ class RegisterEngine:
                 name="RegisterEngine",
             )
             self._worker_thread.start()
-            return {"ok": True, "message": "任务已启动", **self.get_status()}
+            return {
+                "ok": True,
+                "message": f"任务已启动（路径={reg_mode}）",
+                **self.get_status(),
+            }
 
 
 # 兼容旧 CLI 全局入口
@@ -1782,15 +3164,20 @@ engine = RegisterEngine(log_fn=lambda msg, level="info": _cli_logs.emit(msg, lev
 
 def main():
     print("=" * 60 + "\nGrok 注册机\n" + "=" * 60)
+    default_mode = resolve_register_mode()
+    print(f"注册路径: same_session=同会话CLEAN（默认） / protocol=旧混合协议")
+    print(f"当前默认: {default_mode}（可用环境变量 GROK_REGISTER_MODE 覆盖）")
+    mode_in = input(f"\n路径 (默认 {default_mode}): ").strip() or default_mode
+    mode = resolve_register_mode(mode_in)
     try:
-        t = int(input("\n并发数 (默认8): ").strip() or 8)
+        t = int(input("\n并发数 (默认4): ").strip() or 4)
     except Exception:
-        t = 8
+        t = 4
     try:
-        total = int(input("注册数量 (默认100): ").strip() or 100)
+        total = int(input("注册数量 (默认10): ").strip() or 10)
     except Exception:
-        total = 100
-    engine.start(workers=t, target=total, blocking=True)
+        total = 10
+    engine.start(workers=t, target=total, blocking=True, mode=mode)
 
 
 if __name__ == "__main__":

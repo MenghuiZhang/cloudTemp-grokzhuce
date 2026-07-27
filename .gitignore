@@ -1,4 +1,4 @@
-# 环境配置（包含私人信息）
+# 本地密钥与环境（禁止提交）
 .env
 .env.*
 !.env.example
@@ -8,14 +8,24 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
 
-# IDE
+# IDE / 编辑器
 .idea/
 .vscode/
 *.swp
 *.swo
+.ace-tool/
+.claude/
+.agents/
+.playwright-mcp/
+.workbuddy/
 
-# 项目特定
+# 运行产物与隐私数据
 keys/
 logs/
 *.log
@@ -24,11 +34,8 @@ logs/
 *.db
 *.pem
 *.key
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.venv/
-venv/
-.ace-tool/
-.claude/
-.playwright-mcp/
+
+# 代理/个人清单（若本地存在）
+proxies*.txt
+*_proxy*.txt
+*.har

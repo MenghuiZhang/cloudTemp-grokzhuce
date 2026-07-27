@@ -69,7 +69,7 @@ class EmailService:
             "yes",
         )
         s.trust_env = use_proxy
-        retries = Retry(total=2, backoff_factor=0.4, connect=0, read=2, status_forcelist=(502, 503, 504))
+        retries = Retry(total=2, backoff_factor=0.4, status_forcelist=(502, 503, 504))
         adapter = HTTPAdapter(max_retries=retries)
         s.mount("https://", adapter)
         s.mount("http://", adapter)
@@ -108,27 +108,21 @@ class EmailService:
 
         settings: dict = {}
         last_err = ""
-        import time
         for path in (
             "/open_api/settings",
             "/api/open_settings",
             "/open_api/open_settings",
         ):
             try:
-                start = time.time()
                 res = session.get(base + path, headers=headers, timeout=15)
-                elapsed = time.time() - start
                 if res.status_code == 200:
                     data = res.json()
                     if isinstance(data, dict):
                         settings = data
                         break
-                    else:
-                        last_err = f"{path} -> 200 but not dict ({elapsed:.2f}s)"
-                else:
-                    last_err = f"{path} -> {res.status_code} ({elapsed:.2f}s)"
+                last_err = f"{path} -> {res.status_code}"
             except Exception as e:
-                last_err = f"{path} -> {str(e)} ({time.time()-start:.2f}s)"
+                last_err = str(e)
 
         if not settings:
             return {

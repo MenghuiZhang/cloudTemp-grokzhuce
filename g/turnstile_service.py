@@ -19,8 +19,11 @@ class TurnstileService:
             .strip()
             .rstrip("/")
         )
+        # protocol | local | yescaptcha（有 YESCAPTCHA_KEY 时仍优先 yescaptcha）
+        self.solver_mode = (os.getenv("TURNSTILE_MODE") or "").strip().lower()
         self.yescaptcha_api = "https://api.yescaptcha.com"
         self.last_error = ""
+        self._protocol_token_cache: dict[str, str] = {}
 
     @staticmethod
     def _stopped(stop_event) -> bool:
@@ -63,10 +66,38 @@ class TurnstileService:
         """
         创建 Turnstile 任务，返回 task_id。
         失败抛异常；若 stop_event 已置位，抛 RuntimeError('stopped')。
+
+        TURNSTILE_MODE=protocol 时走纯协议路径（HAR 对齐：rch+FO URL/头；默认不注入/不 jsdom）。
         """
         self.last_error = ""
         if self._stopped(stop_event):
             raise RuntimeError("stopped")
+
+        # 纯协议模式：同步跑 harness，结果缓存到假 task_id
+        if self.solver_mode == "protocol" and not self.yescaptcha_key:
+            from g.turnstile_protocol import TurnstileProtocolSolver
+            from pathlib import Path
+
+            dump = Path(__file__).resolve().parents[1] / "logs" / "ts_proto_dump"
+            solver = TurnstileProtocolSolver(
+                site_url=siteurl,
+                sitekey=sitekey,
+                size="flexible",
+                dump_dir=dump,
+                try_node_vm=True,
+                har_body_dir=dump.parent / "har" / "extracted",
+            )
+            result = solver.solve(stop_event=stop_event)
+            task_id = f"proto-{int(time.time() * 1000)}"
+            if result.ok and result.token:
+                self._protocol_token_cache[task_id] = result.token
+                return task_id
+            # 协议未完成：把诊断塞进 last_error，task 标记失败
+            self.last_error = result.error or solver.last_error or "protocol mode 未拿到 token"
+            self._protocol_token_cache[task_id] = ""
+            # 仍返回 task_id，get_response 读缓存
+            self._protocol_token_cache[task_id + ":error"] = self.last_error
+            return task_id
 
         if self.yescaptcha_key:
             url = f"{self.yescaptcha_api}/createTask"
@@ -132,18 +163,37 @@ class TurnstileService:
     def get_response(
         self,
         task_id,
-        max_retries=45,
-        initial_delay=0.8,
-        retry_delay=1.0,
+        max_retries=80,
+        initial_delay=None,
+        retry_delay=None,
         stop_event=None,
-        request_timeout=4,
+        request_timeout=3,
     ):
         """
         轮询获取 Turnstile token。
         支持 stop_event：点停止后最多再等一个短 HTTP 超时即退出。
         成功返回 token；失败返回 None（错误在 last_error）。
+
+        本地 Solver 默认快轮询：首等 ~0.12s、间隔 ~0.28s（TS_POLL_INITIAL / TS_POLL_INTERVAL）。
         """
         self.last_error = ""
+        if initial_delay is None:
+            initial_delay = float(
+                os.getenv("TS_POLL_INITIAL") or ("0.5" if self.yescaptcha_key else "0.12")
+            )
+        if retry_delay is None:
+            retry_delay = float(
+                os.getenv("TS_POLL_INTERVAL") or ("0.8" if self.yescaptcha_key else "0.28")
+            )
+
+        # 纯协议模式：create_task 已同步完成
+        if str(task_id).startswith("proto-"):
+            token = self._protocol_token_cache.pop(task_id, None)
+            err = self._protocol_token_cache.pop(str(task_id) + ":error", "")
+            if token:
+                return token
+            self.last_error = err or self.last_error or "protocol mode 无 token"
+            return None
 
         if self._interruptible_sleep(initial_delay, stop_event):
             self.last_error = "已停止"
@@ -229,7 +279,7 @@ class TurnstileService:
                     return None
                 except Exception as revive_err:
                     self.last_error = f"Solver 断线且恢复失败: {revive_err}"
-                if self._interruptible_sleep(min(retry_delay, 1.5), stop_event):
+                if self._interruptible_sleep(min(float(retry_delay), 1.0), stop_event):
                     self.last_error = "已停止"
                     return None
             except Exception as e:
@@ -238,12 +288,12 @@ class TurnstileService:
                     return None
                 self.last_error = f"轮询异常: {e}"
                 # Solver 连不上时也别死磕太久：短 sleep 后继续，便于 stop 立刻生效
-                if self._interruptible_sleep(min(retry_delay, 1.0), stop_event):
+                if self._interruptible_sleep(min(float(retry_delay), 0.8), stop_event):
                     self.last_error = "已停止"
                     return None
 
         if not self.last_error:
             self.last_error = (
-                f"等待 Turnstile 超时（约 {initial_delay + max_retries * retry_delay:.0f}s）"
+                f"等待 Turnstile 超时（约 {float(initial_delay) + max_retries * float(retry_delay):.0f}s）"
             )
         return None

@@ -715,6 +715,9 @@ class TurnstileAPIServer:
         
         await self._block_rendering(page)
         
+        # Setup FO interceptor for network-level capture
+        self._setup_fo_interceptor(page)
+        
         await page.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', {
             get: () => undefined,
@@ -725,6 +728,68 @@ class TurnstileAPIServer:
             loadTimes: function() {},
             csi: function() {},
         };
+        """)
+
+        # FO dump injection: capture FO1/FO2 plain objects + token
+        await page.add_init_script(r"""
+(function() {
+    'use strict';
+    if (window.__foDump) return;
+    window.__foDump = { fo1: null, fo2: null, token: null, gdrqi3: null };
+    var d = window.__foDump;
+
+    // Poll for G function (FO poster) and hook it
+    var _poll = setInterval(function() {
+        var _G = window.G || (window.__sandbox && window.__sandbox.G);
+        if (typeof _G !== 'function') return;
+        clearInterval(_poll);
+        var orig = _G;
+        var hooked = function(url, plain) {
+            var isFirst = !d.fo1;
+            if (isFirst) {
+                d.fo1 = { url: String(url||''), keys: Object.keys(plain||{}), n: Object.keys(plain||{}).length };
+            } else if (!d.fo2) {
+                d.fo2 = { url: String(url||''), keys: Object.keys(plain||{}), n: Object.keys(plain||{}).length,
+                    plain: plain };
+            }
+            return orig.apply(this, arguments);
+        };
+        if (window.G) window.G = hooked;
+        if (window.__sandbox) window.__sandbox.G = hooked;
+    }, 100);
+
+    // Hook postMessage for token
+    var _pm = window.postMessage;
+    window.postMessage = function(data, origin, transfer) {
+        if (data && data.source === 'cloudflare-challenge' && data.token) {
+            d.token = data.token;
+        }
+        return _pm.call(this, data, origin, transfer);
+    };
+
+    // Hook gDRqi3 to capture FC key material
+    var _gdPoll = setInterval(function() {
+        // gDRqi3 might be in closure, but FA calls it
+        // Hook FA instead to capture gDRqi3's input
+        if (typeof window.FA === 'function' && !window.__faHooked) {
+            window.__faHooked = true;
+            var origFA = window.FA;
+            // Override gDRqi3 if it's on window, or hook FA input
+            if (typeof window.gDRqi3 === 'function') {
+                window.__gdLog = [];
+                var origGd = window.gDRqi3;
+                window.gDRqi3 = function(k) {
+                    var arr = [];
+                    for (var i = 0; i < k.length; i++) arr.push(k[i]);
+                    window.__gdLog.push({fc_key: arr, ts: Date.now(), len: k.length});
+                    d.gdrqi3 = {fc_keys: window.__gdLog};
+                    return origGd(k);
+                };
+            }
+            clearInterval(_gdPoll);
+        }
+    }, 50);
+})();
         """)
         
         if self.browser_type in ['chromium', 'chrome', 'msedge']:
@@ -752,13 +817,16 @@ class TurnstileAPIServer:
             
             await self._inject_captcha_directly(page, sitekey, action or '', cdata or '', index)
             
-            # 原先固定睡 3s 太肥：改 1.0s 起步，token 好了立刻拿走
-            await asyncio.sleep(1.0)
+            # Capture RCH page from Turnstile iframe
+            asyncio.create_task(self._capture_rch_from_iframe(page))
+            
+            # 注入后稍等 widget 挂载；压到 0.25，成功主要靠下面快轮询
+            await asyncio.sleep(0.25)
 
             locator = page.locator('input[name="cf-turnstile-response"]')
-            max_attempts = 36
+            max_attempts = 60
             click_count = 0
-            max_clicks = 10
+            max_clicks = 12
 
             for attempt in range(max_attempts):
                 try:
@@ -776,10 +844,11 @@ class TurnstileAPIServer:
                     elif count == 1:
                         # Если только один элемент, проверяем его токен
                         try:
-                            token = await locator.input_value(timeout=500)
+                            token = await locator.input_value(timeout=250)
                             if token:
                                 elapsed_time = round(time.time() - start_time, 3)
                                 logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
+                                await self._save_fo_dump(page, task_id, token)
                                 await save_result(task_id, "turnstile", {"value": token, "elapsed_time": elapsed_time})
                                 return
                         except Exception as e:
@@ -792,10 +861,11 @@ class TurnstileAPIServer:
 
                         for i in range(count):
                             try:
-                                element_token = await locator.nth(i).input_value(timeout=500)
+                                element_token = await locator.nth(i).input_value(timeout=350)
                                 if element_token:
                                     elapsed_time = round(time.time() - start_time, 3)
                                     logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{element_token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
+                                    await self._save_fo_dump(page, task_id, element_token)
                                     await save_result(task_id, "turnstile", {"value": element_token, "elapsed_time": elapsed_time})
                                     return
                             except Exception as e:
@@ -803,8 +873,8 @@ class TurnstileAPIServer:
                                     logger.debug(f"Browser {index}: Token element {i} check failed: {str(e)}")
                                 continue
 
-                    # 更早尝试点击（原先 attempt>2 才点，白白多等一轮）
-                    if attempt >= 1 and attempt % 2 == 0 and click_count < max_clicks:
+                    # 第 0 轮就尝试点击，别空等
+                    if attempt % 2 == 0 and click_count < max_clicks:
                         click_success = await self._try_click_strategies(page, index)
                         click_count += 1
                         if click_success and self.debug:
@@ -812,8 +882,8 @@ class TurnstileAPIServer:
                         elif not click_success and self.debug:
                             logger.debug(f"Browser {index}: All click strategies failed on attempt {attempt + 1} (click #{click_count}/{max_clicks})")
 
-                    # 更快轮询：0.25s 起，上限 1.2s（原先 0.5~2.0）
-                    wait_time = min(0.25 + (attempt * 0.04), 1.2)
+                    # 更快轮询：0.08s 起，上限 0.45s（token 通常 2~8s 出）
+                    wait_time = min(0.08 + (attempt * 0.02), 0.45)
                     await asyncio.sleep(wait_time)
 
                     if self.debug and attempt % 5 == 0:
@@ -860,6 +930,152 @@ class TurnstileAPIServer:
 
 
 
+
+
+    async def _save_fo_dump(self, page, task_id: str, token: str):
+        """Extract FO dump data from browser and save to disk."""
+        import json, os
+        from datetime import datetime
+        from pathlib import Path
+
+        try:
+            fo_data = getattr(self, '_fo_captured', None)
+            if not fo_data:
+                return
+
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_dir = Path(__file__).resolve().parent / "logs" / "fo_captures" / f"{ts}_{task_id[:8]}"
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            for stage in ('fo1', 'fo2'):
+                req = fo_data.get(f'{stage}_req')
+                resp = fo_data.get(f'{stage}_resp')
+                if req:
+                    (out_dir / f"{stage}_req.txt").write_text(req, encoding="utf-8")
+                    logger.success(f"{stage.upper()} request: {len(req)} bytes")
+                if resp:
+                    (out_dir / f"{stage}_resp.txt").write_text(resp["body"], encoding="utf-8")
+                    (out_dir / f"{stage}_resp_headers.json").write_text(
+                        json.dumps(resp["headers"], indent=2), encoding="utf-8"
+                    )
+                    logger.success(f"{stage.upper()} response: {len(resp['body'])} bytes")
+
+            if token:
+                (out_dir / "token.txt").write_text(token, encoding="utf-8")
+
+            # Capture RCH page from Turnstile iframe
+            rch_html = getattr(self, '_rch_captured', None)
+            if rch_html:
+                (out_dir / "rch.html").write_text(rch_html, encoding="utf-8")
+                logger.success(f"RCH page: {len(rch_html)} bytes")
+
+            # Capture gDRqi3 key data
+            gd_data = getattr(self, '_gd_captured', None)
+            if gd_data:
+                (out_dir / "gdrqi3_calls.json").write_text(
+                    json.dumps(gd_data, indent=2), encoding="utf-8"
+                )
+                logger.success(f"gDRqi3 calls: {len(gd_data)}")
+
+            logger.info(f"FO dump saved to {out_dir}")
+
+        except Exception as e:
+            logger.debug(f"FO dump err: {e}")
+
+    async def _capture_rch_from_iframe(self, page, timeout=8):
+        """Capture Turnstile iframe HTML + inject gDRqi3 hook to grab FC key."""
+        import asyncio
+
+        rch_html = None
+        gd_data = None
+
+        GD_HOOK = """
+(function() {
+    if (window.__gdHooked) return;
+    window.__gdHooked = true;
+    var _poll = setInterval(function() {
+        if (typeof gDRqi3 === 'function' && !window.__gdLog) {
+            window.__gdLog = [];
+            var orig = gDRqi3;
+            gDRqi3 = function(k) {
+                var arr = [];
+                for (var i = 0; i < k.length; i++) arr.push(k[i]);
+                window.__gdLog.push({in: arr, ts: Date.now(), len: k.length});
+                return orig(k);
+            };
+            clearInterval(_poll);
+        }
+    }, 50);
+})();
+        """
+
+        for _ in range(timeout * 2):
+            await asyncio.sleep(0.5)
+            try:
+                for frame in page.frames:
+                    try:
+                        # Inject gDRqi3 hook
+                        await frame.evaluate(GD_HOOK)
+
+                        # Try to get RCH HTML
+                        html = await frame.evaluate("() => document.documentElement.outerHTML")
+                        if html and ('_cf_chl_opt' in html or 'runProgram' in html or 'F7=' in html):
+                            rch_html = html
+
+                        # Try to get gDRqi3 log
+                        gd_log = await frame.evaluate("() => window.__gdLog")
+                        if gd_log and len(gd_log) > 0:
+                            gd_data = gd_log
+                    except Exception:
+                        pass
+                if rch_html:
+                    break
+            except Exception:
+                pass
+
+        if rch_html:
+            self._rch_captured = rch_html
+            logger.success(f"RCH HTML: {len(rch_html)} bytes")
+        if gd_data:
+            self._gd_captured = gd_data
+            logger.success(f"gDRqi3 calls captured: {len(gd_data)}")
+        return rch_html
+
+
+    def _setup_fo_interceptor(self, page):
+        """Setup non-blocking request/response listeners to capture /fo/ traffic."""
+        self._fo_captured = {}
+
+        def on_request(request):
+            url = request.url
+            if '/fo/' in url and request.method == 'POST':
+                is_first = 'fo1_req' not in self._fo_captured
+                stage = 'fo1' if is_first else 'fo2'
+                try:
+                    body = request.post_data
+                    if body:
+                        self._fo_captured[f'{stage}_req'] = body
+                        logger.success(f"Captured {stage.upper()} request: {len(body)} bytes")
+                except Exception as e:
+                    logger.debug(f"FO req err: {e}")
+
+        async def on_response(response):
+            url = response.url
+            if '/fo/' in url and response.request.method == 'POST':
+                is_first = 'fo1_resp' not in self._fo_captured
+                stage = 'fo1' if is_first else 'fo2'
+                try:
+                    body = await response.text()
+                    headers = dict(response.headers)
+                    self._fo_captured[f'{stage}_resp'] = {
+                        "body": body, "headers": headers, "status": response.status,
+                    }
+                    logger.success(f"Captured {stage.upper()} response: {len(body)} bytes, status={response.status}")
+                except Exception as e:
+                    logger.debug(f"FO resp err: {e}")
+
+        page.on('request', on_request)
+        page.on('response', on_response)
 
 
     async def process_turnstile(self):

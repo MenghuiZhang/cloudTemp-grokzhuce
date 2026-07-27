@@ -6,9 +6,6 @@ Grok 注册机 Web 控制台
 import json
 import os
 import re
-import threading
-import time
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -28,49 +25,6 @@ app = Flask(__name__, template_folder=str(BASE_DIR / "templates"), static_folder
 logs = LogBuffer(maxlen=3000)
 engine = RegisterEngine(log_fn=lambda msg, level="info": logs.emit(msg, level))
 
-# 后台导入任务（避免 /api/upstream/import 长时间占用 HTTP 导致页面卡死）
-_import_job_lock = threading.Lock()
-_import_job: dict = {
-    "id": None,
-    "running": False,
-    "status": "idle",  # idle | running | done | error
-    "message": "",
-    "source": "",
-    "total": 0,
-    "done": 0,
-    "success": 0,
-    "fail": 0,
-    "current": "",
-    "started_at": None,
-    "finished_at": None,
-    "result": None,
-    "retry_accounts": [],
-}
-
-
-def get_import_job_public() -> dict:
-    with _import_job_lock:
-        job = dict(_import_job)
-    retry_accounts = job.pop("retry_accounts", [])
-    job["retryable_failures"] = len(retry_accounts) if isinstance(retry_accounts, list) else 0
-    # 不把完整 results 塞进轮询
-    result = job.get("result")
-    if isinstance(result, dict):
-        job["result"] = {
-            "ok": result.get("ok"),
-            "message": result.get("message"),
-            "success": result.get("success"),
-            "fail": result.get("fail"),
-            "total": result.get("total"),
-            "cached_hits": result.get("cached_hits"),
-            "sso_api_hits": result.get("sso_api_hits"),
-            "flow_hits": result.get("flow_hits"),
-            "submitted": result.get("submitted"),
-            "source": result.get("source"),
-            "file": result.get("file"),
-        }
-    return job
-
 CONFIG_KEYS = (
     "WORKER_DOMAIN",
     "FREEMAIL_TOKEN",
@@ -86,6 +40,12 @@ CONFIG_KEYS = (
     "UI_HOST",
     "UI_PORT",
     "SUB2API_URL",
+    "SUB2API_DOCKER_CONTAINER",
+    "SUB2API_DB_HOST",
+    "SUB2API_DB_PORT",
+    "SUB2API_DB_NAME",
+    "SUB2API_DB_USER",
+    "SUB2API_DB_PASSWORD",
     "SUB2API_GROK_GROUP_ID",
     "SUB2API_GROK_GROUP_NAME",
     "UPSTREAM_URL",
@@ -108,7 +68,13 @@ DEFAULTS = {
     "UI_HOST": "127.0.0.1",
     "UI_PORT": "3333",
     "SUB2API_URL": "http://127.0.0.1:9898",
-    "SUB2API_GROK_GROUP_ID": "",
+    "SUB2API_DOCKER_CONTAINER": "sub2api",
+    "SUB2API_DB_HOST": "postgres",
+    "SUB2API_DB_PORT": "5432",
+    "SUB2API_DB_NAME": "sub2api",
+    "SUB2API_DB_USER": "ige",
+    "SUB2API_DB_PASSWORD": "ige_pass",
+    "SUB2API_GROK_GROUP_ID": "23",
     "SUB2API_GROK_GROUP_NAME": "grok",
     "UPSTREAM_URL": "http://127.0.0.1:9898",
     "UPSTREAM_ADMIN_EMAIL": "",
@@ -168,7 +134,7 @@ def write_env_file(values: dict) -> None:
     # ensure example comments if file was empty
     if not existing_lines:
         out = [
-            "# 临时邮箱（cloudflare_temp_email）配置",
+            "# freemail API 配置",
             f"WORKER_DOMAIN={values.get('WORKER_DOMAIN', '')}",
             f"FREEMAIL_TOKEN={values.get('FREEMAIL_TOKEN', '')}",
             f"FREEMAIL_DOMAIN={values.get('FREEMAIL_DOMAIN', DEFAULTS['FREEMAIL_DOMAIN'])}",
@@ -188,8 +154,14 @@ def write_env_file(values: dict) -> None:
             f"UI_HOST={values.get('UI_HOST', DEFAULTS['UI_HOST'])}",
             f"UI_PORT={values.get('UI_PORT', DEFAULTS['UI_PORT'])}",
             "",
-            "# sub2api Grok（HTTP Admin API 导入）",
+            "# sub2api Grok（成功账号导入）",
             f"SUB2API_URL={values.get('SUB2API_URL', DEFAULTS['SUB2API_URL'])}",
+            f"SUB2API_DOCKER_CONTAINER={values.get('SUB2API_DOCKER_CONTAINER', DEFAULTS['SUB2API_DOCKER_CONTAINER'])}",
+            f"SUB2API_DB_HOST={values.get('SUB2API_DB_HOST', DEFAULTS['SUB2API_DB_HOST'])}",
+            f"SUB2API_DB_PORT={values.get('SUB2API_DB_PORT', DEFAULTS['SUB2API_DB_PORT'])}",
+            f"SUB2API_DB_NAME={values.get('SUB2API_DB_NAME', DEFAULTS['SUB2API_DB_NAME'])}",
+            f"SUB2API_DB_USER={values.get('SUB2API_DB_USER', DEFAULTS['SUB2API_DB_USER'])}",
+            f"SUB2API_DB_PASSWORD={values.get('SUB2API_DB_PASSWORD', DEFAULTS['SUB2API_DB_PASSWORD'])}",
             f"SUB2API_GROK_GROUP_ID={values.get('SUB2API_GROK_GROUP_ID', DEFAULTS['SUB2API_GROK_GROUP_ID'])}",
             f"SUB2API_GROK_GROUP_NAME={values.get('SUB2API_GROK_GROUP_NAME', DEFAULTS['SUB2API_GROK_GROUP_NAME'])}",
             f"UPSTREAM_URL={values.get('UPSTREAM_URL', values.get('SUB2API_URL', DEFAULTS['SUB2API_URL']))}",
@@ -216,12 +188,10 @@ def env_snapshot():
     mail_domain = (cfg.get("FREEMAIL_DOMAIN") or DEFAULTS["FREEMAIL_DOMAIN"]).strip() or "auto"
     sub2 = get_sub2api_config_from_cfg(cfg)
     sub2_url = sub2["url"]
-    configured = bool(
-        sub2_url
-        and sub2["group_name"]
-        and sub2["admin_email"]
-        and sub2["admin_password"]
-    )
+    admin_email = sub2.get("admin_email") or ""
+    admin_password = sub2.get("admin_password") or ""
+    # HTTP 导入：URL + 管理员账号密码 + 分组名称（ID 运行时自动解析）
+    configured = bool(sub2_url and admin_email and admin_password and sub2["group_name"])
     return {
         "worker_domain_set": bool(worker),
         "freemail_token_set": bool(token),
@@ -234,13 +204,15 @@ def env_snapshot():
         "ui_host": cfg.get("UI_HOST") or DEFAULTS["UI_HOST"],
         "ui_port": cfg.get("UI_PORT") or DEFAULTS["UI_PORT"],
         "sub2api_url": sub2_url,
+        "sub2api_container": sub2["container"],
         "sub2api_group_id": sub2["group_id"],
         "sub2api_group_name": sub2["group_name"],
         "sub2api_configured": configured,
+        "upstream_admin_email": admin_email,
         # legacy names consumed by existing UI
         "upstream_url": sub2_url,
         "upstream_configured": configured,
-        "upstream_password_set": bool(sub2["admin_password"]),
+        "upstream_password_set": bool(admin_password),
     }
 
 
@@ -257,8 +229,8 @@ def get_upstream_config() -> dict:
     sub2 = get_sub2api_config()
     return {
         "url": sub2["url"],
-        "email": sub2["admin_email"],
-        "password": sub2["admin_password"],
+        "email": sub2.get("admin_email") or "",
+        "password": sub2.get("admin_password") or "",
     }
 
 
@@ -270,6 +242,12 @@ def get_sub2api_config_from_cfg(cfg: dict) -> dict:
     )
     return {
         "url": url,
+        "container": (cfg.get("SUB2API_DOCKER_CONTAINER") or DEFAULTS["SUB2API_DOCKER_CONTAINER"]).strip(),
+        "db_host": (cfg.get("SUB2API_DB_HOST") or DEFAULTS["SUB2API_DB_HOST"]).strip(),
+        "db_port": (cfg.get("SUB2API_DB_PORT") or DEFAULTS["SUB2API_DB_PORT"]).strip(),
+        "db_name": (cfg.get("SUB2API_DB_NAME") or DEFAULTS["SUB2API_DB_NAME"]).strip(),
+        "db_user": (cfg.get("SUB2API_DB_USER") or DEFAULTS["SUB2API_DB_USER"]).strip(),
+        "db_password": (cfg.get("SUB2API_DB_PASSWORD") or DEFAULTS["SUB2API_DB_PASSWORD"]).strip(),
         "group_id": (cfg.get("SUB2API_GROK_GROUP_ID") or DEFAULTS["SUB2API_GROK_GROUP_ID"]).strip(),
         "group_name": (cfg.get("SUB2API_GROK_GROUP_NAME") or DEFAULTS["SUB2API_GROK_GROUP_NAME"]).strip(),
         "admin_email": (cfg.get("UPSTREAM_ADMIN_EMAIL") or "").strip(),
@@ -281,91 +259,205 @@ def get_sub2api_config() -> dict:
     return get_sub2api_config_from_cfg(read_env_file())
 
 
-def _run_sub2api_psql(sql: str, cfg: dict | None = None, timeout: float = 30.0) -> subprocess.CompletedProcess:
-    """通过 psycopg2 直接连接 PostgreSQL 执行 SQL，返回兼容 CompletedProcess 的对象。
+def sub2api_list_groups(
+    *,
+    token: str,
+    base_url: str,
+    platform: str | None = None,
+    page_size: int = 100,
+) -> dict:
+    """拉取 sub2api 分组列表。platform 为空则拉全部分组（便于按名称随意指定）。"""
+    params: dict = {
+        "page": 1,
+        "page_size": max(1, min(int(page_size or 100), 200)),
+    }
+    plat = str(platform or "").strip()
+    if plat:
+        params["platform"] = plat
+    groups_resp = sub2api_http_request(
+        "GET",
+        "/api/v1/admin/groups",
+        token=token,
+        base_url=base_url,
+        params=params,
+        timeout=15,
+    )
+    if not groups_resp.get("ok"):
+        return {
+            "ok": False,
+            "error": groups_resp.get("error") or "读取分组失败",
+            "items": [],
+            "status_code": groups_resp.get("status_code"),
+        }
+    data = groups_resp.get("data") or {}
+    items = data.get("items") if isinstance(data, dict) else []
+    if not isinstance(items, list):
+        items = []
+    cleaned = [it for it in items if isinstance(it, dict)]
+    return {"ok": True, "items": cleaned, "raw": data}
 
-    导入 SQL 常写成 ``BEGIN; ... SELECT ...; COMMIT;``。psycopg2 对多语句
-    execute 后 cursor 停在最后一条（COMMIT 无结果集），直接 fetchall 会报
-    ``no results to fetch``；且 PostgreSQL 不支持 cursor.nextset()。
 
-    处理方式：剥掉外层 BEGIN/COMMIT，由 Python 事务提交，再安全取结果。
+def sub2api_list_grok_groups(
+    *,
+    token: str,
+    base_url: str,
+    page_size: int = 100,
+) -> dict:
+    """兼容旧调用：默认拉全部分组（不再锁死 platform=grok）。"""
+    return sub2api_list_groups(
+        token=token,
+        base_url=base_url,
+        platform=None,
+        page_size=page_size,
+    )
+
+
+def _group_preview_text(items: list[dict], limit: int = 12) -> str:
+    preview = []
+    for it in (items or [])[: max(1, limit)]:
+        if not isinstance(it, dict) or it.get("id") is None:
+            continue
+        name = str(it.get("name") or "").strip() or "?"
+        plat = str(it.get("platform") or "").strip()
+        if plat:
+            preview.append(f"{name}({it.get('id')}/{plat})")
+        else:
+            preview.append(f"{name}({it.get('id')})")
+    return ", ".join(preview)
+
+
+def resolve_sub2api_group(
+    *,
+    token: str,
+    base_url: str,
+    group_name: str | None = None,
+    group_id: str | int | None = None,
+    persist: bool = False,
+    prefer_platform: str | None = "grok",
+) -> dict:
     """
-    import psycopg2
+    按分组名称解析 group_id（名称优先；可指定任意已存在分组，不限 grok）。
+    同名多条时优先 prefer_platform（默认 grok），再精确名、再唯一模糊。
+    命中后可把解析到的 ID 写回 .env。
+    """
+    want_name = str(group_name or "").strip()
+    want_id_raw = str(group_id or "").strip()
+    want_id = None
+    if want_id_raw.isdigit():
+        want_id = int(want_id_raw)
+    prefer = str(prefer_platform or "").strip().lower()
 
-    cfg = cfg or get_sub2api_config()
-    # 去掉脚本式事务包装，交给下方 conn.commit()
-    body = (sql or "").strip()
-    body = re.sub(r"^\s*BEGIN\s*;\s*", "", body, flags=re.IGNORECASE)
-    body = re.sub(r"\s*COMMIT\s*;\s*$", "", body, flags=re.IGNORECASE)
-    body = body.strip()
+    listed = sub2api_list_groups(token=token, base_url=base_url, platform=None)
+    if not listed.get("ok"):
+        return {
+            "ok": False,
+            "error": listed.get("error") or "读取分组失败",
+            "items": [],
+            "status_code": listed.get("status_code"),
+        }
+    items = listed.get("items") or []
 
-    conn = None
+    matched = None
+    match_by = ""
+    if want_name:
+        want_l = want_name.lower()
+        exact = [
+            it for it in items
+            if str(it.get("name") or "").strip().lower() == want_l
+        ]
+        if len(exact) == 1:
+            matched = exact[0]
+            match_by = "name"
+        elif len(exact) > 1:
+            # 同名多平台：优先 prefer_platform
+            if prefer:
+                preferred = [
+                    it for it in exact
+                    if str(it.get("platform") or "").strip().lower() == prefer
+                ]
+                if preferred:
+                    matched = preferred[0]
+                    match_by = f"name+{prefer}"
+            if matched is None:
+                matched = exact[0]
+                match_by = "name_multi"
+        # 包含匹配（仅唯一命中时接受）
+        if matched is None:
+            fuzzy = [
+                it for it in items
+                if want_l in str(it.get("name") or "").strip().lower()
+            ]
+            if len(fuzzy) == 1:
+                matched = fuzzy[0]
+                match_by = "name_fuzzy"
+            elif len(fuzzy) > 1 and prefer:
+                preferred = [
+                    it for it in fuzzy
+                    if str(it.get("platform") or "").strip().lower() == prefer
+                ]
+                if len(preferred) == 1:
+                    matched = preferred[0]
+                    match_by = f"name_fuzzy+{prefer}"
+        # 填了名称就必须按名称命中，禁止回退到旧 ID
+    elif want_id is not None:
+        for it in items:
+            try:
+                if int(it.get("id") or 0) == want_id:
+                    matched = it
+                    match_by = "id"
+                    break
+            except (TypeError, ValueError):
+                continue
+
+    if matched is None:
+        preview = _group_preview_text(items, 12)
+        hint = f"可选: {preview}" if preview else "当前无任何分组"
+        target = want_name or (f"id={want_id}" if want_id is not None else "(未指定)")
+        return {
+            "ok": False,
+            "error": (
+                f"sub2api 分组未匹配: {target}。{hint}。"
+                "名称必须是 sub2api 里已有的分组（可任意平台）；新分组请先在 sub2api 后台创建。"
+            ),
+            "items": items,
+            "group_name": want_name,
+            "group_id": want_id,
+        }
+
     try:
-        conn = psycopg2.connect(
-            host=cfg["db_host"],
-            port=int(cfg["db_port"]),
-            user=cfg["db_user"],
-            password=cfg["db_password"],
-            dbname=cfg["db_name"],
-            connect_timeout=min(int(timeout), 10),
-        )
-        conn.autocommit = False
-        cur = conn.cursor()
-        cur.execute(body)
+        gid = int(matched.get("id"))
+    except (TypeError, ValueError):
+        return {
+            "ok": False,
+            "error": f"分组 ID 非法: {matched.get('id')}",
+            "items": items,
+        }
+    gname = str(matched.get("name") or want_name or "").strip() or str(gid)
+    gplat = str(matched.get("platform") or "").strip()
 
-        rows = []
-        if cur.description is not None:
-            rows = cur.fetchall()
+    if persist:
+        try:
+            cfg = read_env_file()
+            cfg["SUB2API_GROK_GROUP_ID"] = str(gid)
+            cfg["SUB2API_GROK_GROUP_NAME"] = gname
+            write_env_file(cfg)
+            apply_env_to_process({
+                "SUB2API_GROK_GROUP_ID": str(gid),
+                "SUB2API_GROK_GROUP_NAME": gname,
+            })
+        except Exception:
+            # 解析成功即可用；写回失败不阻断导入
+            pass
 
-        cur.close()
-        conn.commit()
-        conn.close()
-        conn = None
-
-        output_lines = []
-        for row in rows:
-            if len(row) == 1:
-                output_lines.append(str(row[0]) if row[0] is not None else "")
-            else:
-                output_lines.append(
-                    "|".join(str(v) if v is not None else "" for v in row)
-                )
-        return subprocess.CompletedProcess(
-            args=["psycopg2"],
-            returncode=0,
-            stdout="\n".join(output_lines),
-            stderr="",
-        )
-    except Exception as e:
-        if conn is not None:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-            try:
-                conn.close()
-            except Exception:
-                pass
-        return subprocess.CompletedProcess(
-            args=["psycopg2"],
-            returncode=1,
-            stdout="",
-            stderr=str(e),
-        )
-
-
-def _last_json_line(stdout: str) -> dict:
-    for line in reversed((stdout or "").splitlines()):
-        line = line.strip()
-        if line.startswith("{") and line.endswith("}"):
-            return json.loads(line)
-    return {}
-
-
-def _sql_literal(value) -> str:
-    if value is None:
-        return "NULL"
-    return "'" + str(value).replace("'", "''") + "'"
+    return {
+        "ok": True,
+        "group_id": gid,
+        "group_name": gname,
+        "platform": gplat,
+        "match_by": match_by,
+        "group": matched,
+        "items": items,
+    }
 
 
 def _rfc3339_seconds(value) -> str:
@@ -433,119 +525,10 @@ def _entry_to_sub2api_credentials(entry: dict, email_hint: str = "") -> tuple[di
         credentials["scope"] = payload.get("scope")
     if payload.get("team_id"):
         credentials["team_id"] = payload.get("team_id")
+    if payload.get("sub"):
+        credentials["sub"] = payload.get("sub")
     name = email or (f"Grok {user_id}" if user_id else "Grok OAuth")
     return credentials, name, auth_key, user_id, email
-
-
-def _legacy_sub2api_import_auth_entry_postgres(entry: dict, email_hint: str = "", merge: bool = True) -> dict:
-    cfg = get_sub2api_config()
-    credentials, name, auth_key, user_id, email = _entry_to_sub2api_credentials(entry, email_hint)
-    try:
-        group_id = int(cfg["group_id"])
-    except (TypeError, ValueError):
-        return {
-            "ok": False,
-            "error": "未配置 SUB2API_GROK_GROUP_ID，请在配置页填写 sub2api Grok 分组 ID",
-            "email": email or None,
-            "user_id": user_id or None,
-        }
-    merge_sql = "TRUE" if merge else "FALSE"
-    sql = f"""
-BEGIN;
-WITH incoming AS (
-    SELECT
-        {_sql_literal(name)}::text AS name,
-        {_sql_literal(json.dumps(credentials, ensure_ascii=False, separators=(",", ":")))}::jsonb AS credentials,
-        {_sql_literal(auth_key)}::text AS auth_key,
-        {_sql_literal(user_id)}::text AS user_id,
-        {_sql_literal(email)}::text AS email
-), matched AS (
-    SELECT a.id
-    FROM accounts a, incoming i
-    WHERE a.platform = 'grok'
-      AND a.deleted_at IS NULL
-      AND (
-        (i.auth_key <> '' AND a.credentials->>'auth_key' = i.auth_key)
-        OR (i.user_id <> '' AND a.credentials->>'user_id' = i.user_id)
-        OR (i.email <> '' AND lower(a.credentials->>'email') = lower(i.email))
-      )
-    ORDER BY a.id
-    LIMIT 1
-), updated AS (
-    UPDATE accounts a
-    SET name = i.name,
-        platform = 'grok',
-        type = 'oauth',
-        credentials = i.credentials,
-        concurrency = 1,
-        priority = 50,
-        status = 'active',
-        error_message = NULL,
-        schedulable = TRUE,
-        rate_limited_at = NULL,
-        rate_limit_reset_at = NULL,
-        overload_until = NULL,
-        temp_unschedulable_until = NULL,
-        temp_unschedulable_reason = NULL,
-        auto_pause_on_expired = TRUE,
-        rate_multiplier = 1.0,
-        updated_at = NOW(),
-        deleted_at = NULL
-    FROM incoming i, matched m
-    WHERE a.id = m.id AND {merge_sql}
-    RETURNING a.id, 'updated'::text AS action
-), inserted AS (
-    INSERT INTO accounts (
-        name, platform, type, credentials, extra, concurrency, priority, status,
-        schedulable, auto_pause_on_expired, rate_multiplier, created_at, updated_at
-    )
-    SELECT
-        i.name, 'grok', 'oauth', i.credentials, '{{}}'::jsonb, 1, 50, 'active',
-        TRUE, TRUE, 1.0, NOW(), NOW()
-    FROM incoming i
-    WHERE NOT EXISTS (SELECT 1 FROM matched)
-    RETURNING id, 'inserted'::text AS action
-), chosen AS (
-    SELECT * FROM updated
-    UNION ALL
-    SELECT * FROM inserted
-), grouped AS (
-    INSERT INTO account_groups (account_id, group_id, priority, created_at)
-    SELECT id, {group_id}, 50, NOW() FROM chosen
-    ON CONFLICT (account_id, group_id) DO UPDATE SET priority = EXCLUDED.priority
-    RETURNING account_id
-)
-SELECT json_build_object(
-    'ok', EXISTS(SELECT 1 FROM chosen),
-    'id', (SELECT id FROM chosen LIMIT 1),
-    'action', (SELECT action FROM chosen LIMIT 1),
-    'duplicate', EXISTS(SELECT 1 FROM matched) AND NOT {merge_sql},
-    'group_id', {group_id},
-    'email', {_sql_literal(email)},
-    'user_id', {_sql_literal(user_id)},
-    'auth_key', {_sql_literal(auth_key)},
-    'expires_at', {_sql_literal(credentials.get('expires_at') or '')},
-    'has_refresh_token', {str(bool(credentials.get('refresh_token'))).upper()}
-)::text;
-COMMIT;
-"""
-    proc = _run_sub2api_psql(sql, cfg=cfg, timeout=45.0)
-    if proc.returncode != 0:
-        return {
-            "ok": False,
-            "error": (proc.stderr or proc.stdout or "sub2api psql 写入失败").strip()[-500:],
-            "email": email or None,
-            "user_id": user_id or None,
-        }
-    data = _last_json_line(proc.stdout)
-    if not data.get("ok"):
-        return {
-            "ok": False,
-            "error": "sub2api 已存在相同账号",
-            "email": email or None,
-            "user_id": user_id or None,
-        }
-    return data
 
 
 def _http_session():
@@ -557,18 +540,476 @@ def _http_session():
     return s
 
 
-def _legacy_test_upstream_connectivity_postgres(base_url: str | None = None, password: str | None = None) -> dict:
-    """验证 sub2api Web 与 Grok 分组数据库写入通道。"""
+def _sub2api_api_data(resp_json) -> dict | list | None:
+    """解析 sub2api 统一响应 {code, message, data}。"""
+    if not isinstance(resp_json, dict):
+        return None
+    if "data" in resp_json:
+        return resp_json.get("data")
+    return resp_json
+
+
+def _sub2api_api_ok(status_code: int, resp_json) -> bool:
+    if status_code < 200 or status_code >= 300:
+        return False
+    if isinstance(resp_json, dict) and "code" in resp_json:
+        try:
+            return int(resp_json.get("code")) == 0
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
+def _sub2api_api_message(resp_json, fallback: str = "") -> str:
+    if isinstance(resp_json, dict):
+        msg = resp_json.get("message") or resp_json.get("error") or ""
+        if msg:
+            return str(msg)
+        data = resp_json.get("data")
+        if isinstance(data, dict) and data.get("message"):
+            return str(data["message"])
+    return fallback or "unknown error"
+
+
+def sub2api_http_login(
+    base_url: str | None = None,
+    email: str | None = None,
+    password: str | None = None,
+    cfg: dict | None = None,
+) -> dict:
+    """管理员登录，拿 Bearer access_token。"""
     import requests
 
-    del password
+    cfg = dict(cfg or get_sub2api_config())
+    base = normalize_upstream_url(base_url if base_url is not None else cfg.get("url"))
+    admin_email = (email if email is not None else cfg.get("admin_email") or "").strip()
+    admin_password = password if password is not None else (cfg.get("admin_password") or "")
+    if not base:
+        return {"ok": False, "error": "请先填写 SUB2API_URL"}
+    if not admin_email or not admin_password:
+        return {"ok": False, "error": "请先填写 UPSTREAM_ADMIN_EMAIL / UPSTREAM_ADMIN_PASSWORD"}
+
+    try:
+        r = _http_session().post(
+            f"{base}/api/v1/auth/login",
+            json={"email": admin_email, "password": admin_password},
+            timeout=12,
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+        )
+        try:
+            body = r.json()
+        except Exception:
+            body = {"raw": (r.text or "")[:300]}
+        if not _sub2api_api_ok(r.status_code, body):
+            return {
+                "ok": False,
+                "error": f"登录失败 HTTP {r.status_code}: {_sub2api_api_message(body, r.text[:200])}",
+                "status_code": r.status_code,
+                "base_url": base,
+            }
+        data = _sub2api_api_data(body) or {}
+        if not isinstance(data, dict):
+            data = {}
+        token = (
+            data.get("access_token")
+            or data.get("token")
+            or body.get("access_token")
+            or body.get("token")
+            or ""
+        )
+        if not token:
+            return {"ok": False, "error": "登录成功但未返回 access_token", "base_url": base}
+        return {
+            "ok": True,
+            "access_token": token,
+            "refresh_token": data.get("refresh_token") or "",
+            "base_url": base,
+            "email": admin_email,
+        }
+    except requests.exceptions.ConnectionError:
+        return {"ok": False, "error": f"连接 sub2api 失败: {base}", "base_url": base}
+    except requests.exceptions.Timeout:
+        return {"ok": False, "error": f"登录超时: {base}", "base_url": base}
+    except Exception as e:
+        return {"ok": False, "error": f"登录异常: {e}", "base_url": base}
+
+
+def sub2api_http_request(
+    method: str,
+    path: str,
+    *,
+    token: str,
+    base_url: str,
+    json_body: dict | list | None = None,
+    params: dict | None = None,
+    timeout: float = 30.0,
+) -> dict:
+    """带 Bearer 的 sub2api Admin API 请求。"""
+    import requests
+
+    base = normalize_upstream_url(base_url)
+    if not base:
+        return {"ok": False, "error": "缺少 base_url"}
+    if not path.startswith("/"):
+        path = "/" + path
+    url = f"{base}{path}"
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+    }
+    try:
+        r = _http_session().request(
+            method.upper(),
+            url,
+            headers=headers,
+            json=json_body,
+            params=params,
+            timeout=timeout,
+        )
+        try:
+            body = r.json()
+        except Exception:
+            body = {"raw": (r.text or "")[:500]}
+        ok = _sub2api_api_ok(r.status_code, body)
+        return {
+            "ok": ok,
+            "status_code": r.status_code,
+            "body": body,
+            "data": _sub2api_api_data(body),
+            "error": None if ok else _sub2api_api_message(body, f"HTTP {r.status_code}"),
+        }
+    except requests.exceptions.ConnectionError:
+        return {"ok": False, "error": f"连接失败: {url}"}
+    except requests.exceptions.Timeout:
+        return {"ok": False, "error": f"请求超时: {url}"}
+    except Exception as e:
+        return {"ok": False, "error": f"请求异常: {e}"}
+
+
+def sub2api_find_account(
+    token: str,
+    base_url: str,
+    *,
+    email: str = "",
+    user_id: str = "",
+    auth_key: str = "",
+    name: str = "",
+) -> dict | None:
+    """按 email / user_id / auth_key 在 grok 账号里找已有记录。"""
+    keywords: list[str] = []
+    for k in (email, user_id, name, (auth_key.split("::")[-1] if auth_key else "")):
+        k = (k or "").strip()
+        if k and k not in keywords:
+            keywords.append(k)
+    if not keywords:
+        return None
+
+    for kw in keywords[:3]:
+        resp = sub2api_http_request(
+            "GET",
+            "/api/v1/admin/accounts",
+            token=token,
+            base_url=base_url,
+            params={
+                "page": 1,
+                "page_size": 20,
+                "platform": "grok",
+                "keyword": kw,
+            },
+            timeout=15,
+        )
+        if not resp.get("ok"):
+            continue
+        data = resp.get("data") or {}
+        items = data.get("items") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            continue
+        email_l = (email or "").strip().lower()
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            cred = it.get("credentials") or {}
+            if not isinstance(cred, dict):
+                cred = {}
+            it_email = (cred.get("email") or it.get("name") or "").strip().lower()
+            it_uid = str(cred.get("user_id") or cred.get("sub") or "").strip()
+            it_ak = str(cred.get("auth_key") or "").strip()
+            if email_l and it_email == email_l:
+                return it
+            if user_id and it_uid and it_uid == user_id:
+                return it
+            if auth_key and it_ak and it_ak == auth_key:
+                return it
+            if name and (it.get("name") or "") == name:
+                return it
+    return None
+
+
+def sub2api_import_auth_entry(
+    entry: dict,
+    email_hint: str = "",
+    merge: bool = True,
+    *,
+    token: str | None = None,
+    base_url: str | None = None,
+    cfg: dict | None = None,
+) -> dict:
+    """通过 HTTP Admin API 写入/更新 grok oauth 账号。"""
+    cfg = dict(cfg or get_sub2api_config())
+    base = normalize_upstream_url(base_url or cfg.get("url"))
+    credentials, name, auth_key, user_id, email = _entry_to_sub2api_credentials(entry, email_hint)
+
+    if not token:
+        login = sub2api_http_login(base_url=base, cfg=cfg)
+        if not login.get("ok"):
+            return {
+                "ok": False,
+                "error": login.get("error") or "sub2api 登录失败",
+                "email": email or None,
+                "user_id": user_id or None,
+            }
+        token = login["access_token"]
+        base = login.get("base_url") or base
+
+    # 优先按分组名称解析 ID；已有数字 ID 仅作兜底
+    resolved = resolve_sub2api_group(
+        token=token,
+        base_url=base,
+        group_name=cfg.get("group_name"),
+        group_id=cfg.get("group_id"),
+        persist=False,
+    )
+    if not resolved.get("ok"):
+        return {
+            "ok": False,
+            "error": resolved.get("error") or "分组解析失败",
+            "email": email or None,
+            "user_id": user_id or None,
+        }
+    group_id = int(resolved["group_id"])
+    cfg["group_id"] = str(group_id)
+    if resolved.get("group_name"):
+        cfg["group_name"] = str(resolved["group_name"])
+
+    existing = sub2api_find_account(
+        token,
+        base,
+        email=email,
+        user_id=user_id,
+        auth_key=auth_key,
+        name=name,
+    )
+
+    payload = {
+        "name": name,
+        "platform": "grok",
+        "type": "oauth",
+        "group_ids": [group_id],
+        "concurrency": 1,
+        "priority": 50,
+        "rate_multiplier": 1.0,
+        "auto_pause_on_expired": True,
+        "status": "active",
+        "schedulable": True,
+        "credentials": credentials,
+    }
+
+    if existing and existing.get("id") is not None:
+        if not merge:
+            return {
+                "ok": False,
+                "error": "sub2api 已存在相同账号",
+                "email": email or None,
+                "user_id": user_id or None,
+                "id": existing.get("id"),
+                "duplicate": True,
+            }
+        account_id = existing["id"]
+        # 保留已有分组，确保目标 group 在列表里
+        old_gids = existing.get("group_ids") or []
+        if isinstance(old_gids, list):
+            gids = []
+            for g in old_gids:
+                try:
+                    gids.append(int(g))
+                except (TypeError, ValueError):
+                    pass
+            if group_id not in gids:
+                gids.append(group_id)
+            if gids:
+                payload["group_ids"] = gids
+        resp = sub2api_http_request(
+            "PUT",
+            f"/api/v1/admin/accounts/{account_id}",
+            token=token,
+            base_url=base,
+            json_body=payload,
+            timeout=30,
+        )
+        if not resp.get("ok"):
+            return {
+                "ok": False,
+                "error": resp.get("error") or "更新账号失败",
+                "email": email or None,
+                "user_id": user_id or None,
+            }
+        data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+        return {
+            "ok": True,
+            "id": data.get("id") or account_id,
+            "action": "updated",
+            "group_id": group_id,
+            "email": email or None,
+            "user_id": user_id or None,
+            "auth_key": auth_key,
+            "expires_at": credentials.get("expires_at") or "",
+            "has_refresh_token": bool(credentials.get("refresh_token")),
+        }
+
+    resp = sub2api_http_request(
+        "POST",
+        "/api/v1/admin/accounts",
+        token=token,
+        base_url=base,
+        json_body=payload,
+        timeout=30,
+    )
+    if not resp.get("ok"):
+        return {
+            "ok": False,
+            "error": resp.get("error") or "创建账号失败",
+            "email": email or None,
+            "user_id": user_id or None,
+        }
+    data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+    return {
+        "ok": True,
+        "id": data.get("id"),
+        "action": "inserted",
+        "group_id": group_id,
+        "email": email or None,
+        "user_id": user_id or None,
+        "auth_key": auth_key,
+        "expires_at": credentials.get("expires_at") or "",
+        "has_refresh_token": bool(credentials.get("refresh_token")),
+    }
+
+
+def sub2api_import_sso_tokens_http(
+    sso_tokens: list[str],
+    *,
+    token: str,
+    base_url: str,
+    group_id: int,
+    emails: list[str] | None = None,
+) -> dict:
+    """
+    调用 sub2api 服务端 sso-to-oauth：
+    POST /api/v1/admin/grok/sso-to-oauth
+    body: {sso_tokens, group_ids}
+    返回 data: {created: [...], failed: [{index, error}, ...]}
+    """
+    tokens = [str(t).strip() for t in (sso_tokens or []) if str(t).strip()]
+    if not tokens:
+        return {"ok": False, "error": "sso_tokens 为空", "created": [], "failed": []}
+
+    body: dict = {
+        "sso_tokens": tokens,
+        "group_ids": [int(group_id)],
+        "auto_pause_on_expired": True,
+    }
+    # 部分版本支持 name；不强制
+    if emails and len(emails) == 1 and emails[0]:
+        body["name"] = emails[0]
+
+    resp = sub2api_http_request(
+        "POST",
+        "/api/v1/admin/grok/sso-to-oauth",
+        token=token,
+        base_url=base_url,
+        json_body=body,
+        timeout=120,
+    )
+    if not resp.get("ok"):
+        return {
+            "ok": False,
+            "error": resp.get("error") or "sso-to-oauth 失败",
+            "created": [],
+            "failed": [{"index": i + 1, "error": resp.get("error") or "request failed"} for i in range(len(tokens))],
+            "status_code": resp.get("status_code"),
+        }
+    data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+    created_raw = data.get("created") if isinstance(data.get("created"), list) else []
+    failed = data.get("failed") if isinstance(data.get("failed"), list) else []
+    # 服务端结构：{index, name, email, account:{id, credentials, ...}}
+    # 展平 account，方便上层直接取 id / credentials
+    created: list[dict] = []
+    for c in created_raw:
+        if not isinstance(c, dict):
+            continue
+        acc = c.get("account") if isinstance(c.get("account"), dict) else {}
+        flat = dict(c)
+        if acc:
+            # 顶层优先保留 index/name/email；id/credentials 从 account 补
+            if flat.get("id") is None and acc.get("id") is not None:
+                flat["id"] = acc.get("id")
+            if not isinstance(flat.get("credentials"), dict) and isinstance(
+                acc.get("credentials"), dict
+            ):
+                flat["credentials"] = acc.get("credentials")
+            for k in ("user_id", "expires_at", "status", "platform", "type"):
+                if flat.get(k) is None and acc.get(k) is not None:
+                    flat[k] = acc.get(k)
+            if not flat.get("email"):
+                cred = acc.get("credentials") if isinstance(acc.get("credentials"), dict) else {}
+                flat["email"] = (
+                    c.get("email")
+                    or acc.get("name")
+                    or cred.get("email")
+                    or c.get("name")
+                )
+            flat["_account"] = acc
+        created.append(flat)
+    return {
+        "ok": True,
+        "created": created,
+        "failed": failed,
+        "raw": data,
+    }
+
+
+def test_upstream_connectivity(
+    base_url: str | None = None,
+    password: str | None = None,
+    email: str | None = None,
+    group_id: str | int | None = None,
+    group_name: str | None = None,
+) -> dict:
+    """验证 sub2api HTTP 登录，并按分组名称自动解析 group_id。"""
+    import requests
+
     cfg = get_sub2api_config()
     base = normalize_upstream_url(base_url if base_url is not None else cfg["url"])
+    admin_email = (email if email is not None else cfg.get("admin_email") or "").strip()
+    admin_password = password if password is not None else (cfg.get("admin_password") or "")
     if base:
         cfg["url"] = base
+    if admin_email:
+        cfg["admin_email"] = admin_email
+    if admin_password is not None and str(admin_password) != "":
+        cfg["admin_password"] = admin_password
+    if group_id is not None and str(group_id).strip() != "":
+        cfg["group_id"] = str(group_id).strip()
+    if group_name is not None and str(group_name).strip() != "":
+        cfg["group_name"] = str(group_name).strip()
 
     if not base:
         return {"ok": False, "message": "请先填写 SUB2API_URL"}
+    if not cfg.get("admin_email") or not cfg.get("admin_password"):
+        return {"ok": False, "message": "请先填写管理员邮箱与密码（UPSTREAM_ADMIN_EMAIL / PASSWORD）", "base_url": base}
+    if not str(cfg.get("group_name") or "").strip():
+        return {"ok": False, "message": "请先填写分组名称（SUB2API_GROK_GROUP_NAME）", "base_url": base}
 
     health = None
     try:
@@ -592,526 +1033,66 @@ def _legacy_test_upstream_connectivity_postgres(base_url: str | None = None, pas
     except Exception as e:
         return {"ok": False, "message": f"sub2api 健康检查异常: {e}", "base_url": base}
 
-    try:
-        group_id = int(cfg["group_id"] or "23")
-    except ValueError:
-        return {"ok": False, "message": "SUB2API_GROK_GROUP_ID 必须是数字", "base_url": base}
-
-    sql = f"""
-SELECT json_build_object(
-  'ok', true,
-  'group_id', g.id,
-  'group_name', g.name,
-  'platform', g.platform,
-  'status', g.status,
-  'active_accounts', (
-    SELECT count(*) FROM accounts a
-    JOIN account_groups ag ON ag.account_id = a.id
-    WHERE ag.group_id = g.id AND a.deleted_at IS NULL AND a.platform = 'grok' AND a.status = 'active'
-  )
-)::text
-FROM groups g
-WHERE g.id = {group_id} AND g.name = {_sql_literal(cfg['group_name'])} AND g.platform = 'grok'
-LIMIT 1;
-"""
-    try:
-        proc = _run_sub2api_psql(sql, cfg=cfg, timeout=20.0)
-    except Exception as e:
-        return {"ok": False, "message": f"sub2api 数据库探测异常: {e}", "base_url": base, "health": health}
-
-    if proc.returncode != 0:
-        return {
-            "ok": False,
-            "message": "sub2api 数据库探测失败: " + (proc.stderr or proc.stdout or "").strip()[-300:],
-            "base_url": base,
-            "health": health,
-        }
-    db = _last_json_line(proc.stdout)
-    if not db.get("ok"):
-        return {
-            "ok": False,
-            "message": f"sub2api Grok 分组未匹配：id={group_id}, name={cfg['group_name']}",
-            "base_url": base,
-            "health": health,
-        }
-
-    return {
-        "ok": True,
-        "message": f"sub2api 连通正常，Grok 分组 {db.get('group_name')}({db.get('group_id')}) 可写入",
-        "base_url": base,
-        "health": health,
-        "health_ok": True,
-        "db_ok": True,
-        "group": db,
-    }
-
-
-def _sub2api_http_session():
-    """HTTP 导入不继承本机代理设置，保证局域网 sub2api 可直连。"""
-    import requests
-
-    session = requests.Session()
-    session.trust_env = False
-    return session
-
-
-def _sub2api_api_data(body) -> dict | list | None:
-    if not isinstance(body, dict):
-        return None
-    return body.get("data") if "data" in body else body
-
-
-def _sub2api_api_ok(status_code: int, body) -> bool:
-    if not 200 <= status_code < 300:
-        return False
-    if isinstance(body, dict) and "code" in body:
-        try:
-            return int(body.get("code")) == 0
-        except (TypeError, ValueError):
-            return False
-    return True
-
-
-def _sub2api_api_message(body, fallback: str = "") -> str:
-    if isinstance(body, dict):
-        message = body.get("message") or body.get("error")
-        if message:
-            return str(message)
-        data = body.get("data")
-        if isinstance(data, dict) and data.get("message"):
-            return str(data["message"])
-    return fallback or "unknown error"
-
-
-def sub2api_http_login(
-    base_url: str | None = None,
-    email: str | None = None,
-    password: str | None = None,
-    cfg: dict | None = None,
-) -> dict:
-    """登录 sub2api Admin API 并返回 Bearer access token。"""
-    import requests
-
-    cfg = dict(cfg or get_sub2api_config())
-    base = normalize_upstream_url(base_url if base_url is not None else cfg.get("url"))
-    admin_email = (email if email is not None else cfg.get("admin_email") or "").strip()
-    admin_password = password if password is not None else cfg.get("admin_password") or ""
-    if not base:
-        return {"ok": False, "error": "请先填写 SUB2API_URL"}
-    if not admin_email or not admin_password:
-        return {"ok": False, "error": "请先填写 UPSTREAM_ADMIN_EMAIL / UPSTREAM_ADMIN_PASSWORD"}
-
-    try:
-        response = _sub2api_http_session().post(
-            f"{base}/api/v1/auth/login",
-            json={"email": admin_email, "password": admin_password},
-            headers={"Accept": "application/json", "Content-Type": "application/json"},
-            timeout=12,
-        )
-        try:
-            body = response.json()
-        except Exception:
-            body = {"raw": (response.text or "")[:300]}
-        if not _sub2api_api_ok(response.status_code, body):
-            return {
-                "ok": False,
-                "error": f"登录失败 HTTP {response.status_code}: {_sub2api_api_message(body, response.text[:200])}",
-                "status_code": response.status_code,
-                "base_url": base,
-            }
-        data = _sub2api_api_data(body)
-        if not isinstance(data, dict):
-            data = {}
-        access_token = (
-            data.get("access_token")
-            or data.get("token")
-            or body.get("access_token")
-            or body.get("token")
-            or ""
-        )
-        if not access_token:
-            return {"ok": False, "error": "登录成功但未返回 access_token", "base_url": base}
-        return {"ok": True, "access_token": access_token, "base_url": base}
-    except requests.exceptions.ConnectionError:
-        return {"ok": False, "error": f"连接 sub2api 失败: {base}", "base_url": base}
-    except requests.exceptions.Timeout:
-        return {"ok": False, "error": f"登录超时: {base}", "base_url": base}
-    except Exception as exc:
-        return {"ok": False, "error": f"登录异常: {exc}", "base_url": base}
-
-
-def sub2api_http_request(
-    method: str,
-    path: str,
-    *,
-    token: str,
-    base_url: str,
-    json_body: dict | list | None = None,
-    params: dict | None = None,
-    timeout: float = 30.0,
-) -> dict:
-    """发送带 Bearer 认证的 sub2api Admin API 请求。"""
-    import requests
-
-    base = normalize_upstream_url(base_url)
-    if not base:
-        return {"ok": False, "error": "缺少 SUB2API_URL"}
-    if not path.startswith("/"):
-        path = "/" + path
-    url = f"{base}{path}"
-    try:
-        response = _sub2api_http_session().request(
-            method.upper(),
-            url,
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {token}",
-            },
-            json=json_body,
-            params=params,
-            timeout=timeout,
-        )
-        try:
-            body = response.json()
-        except Exception:
-            body = {"raw": (response.text or "")[:500]}
-        ok = _sub2api_api_ok(response.status_code, body)
-        return {
-            "ok": ok,
-            "status_code": response.status_code,
-            "body": body,
-            "data": _sub2api_api_data(body),
-            "error": None if ok else _sub2api_api_message(body, f"HTTP {response.status_code}"),
-        }
-    except requests.exceptions.ConnectionError:
-        return {"ok": False, "error": f"连接失败: {url}"}
-    except requests.exceptions.Timeout:
-        return {"ok": False, "error": f"请求超时: {url}"}
-    except Exception as exc:
-        return {"ok": False, "error": f"请求异常: {exc}"}
-
-
-def sub2api_find_account(
-    token: str,
-    base_url: str,
-    *,
-    email: str = "",
-    user_id: str = "",
-    auth_key: str = "",
-    name: str = "",
-) -> dict | None:
-    """按稳定身份字段查找已有 Grok OAuth 账号。"""
-    keywords: list[str] = []
-    for value in (email, user_id, name, auth_key.split("::")[-1] if auth_key else ""):
-        value = (value or "").strip()
-        if value and value not in keywords:
-            keywords.append(value)
-    for keyword in keywords[:3]:
-        response = sub2api_http_request(
-            "GET",
-            "/api/v1/admin/accounts",
-            token=token,
-            base_url=base_url,
-            params={"page": 1, "page_size": 20, "platform": "grok", "keyword": keyword},
-            timeout=15,
-        )
-        data = response.get("data") or {}
-        items = data.get("items") if isinstance(data, dict) else []
-        if not response.get("ok") or not isinstance(items, list):
-            continue
-        email_l = email.strip().lower()
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            credentials = item.get("credentials") or {}
-            if not isinstance(credentials, dict):
-                credentials = {}
-            item_email = (credentials.get("email") or item.get("name") or "").strip().lower()
-            item_user_id = str(credentials.get("user_id") or credentials.get("sub") or "").strip()
-            item_auth_key = str(credentials.get("auth_key") or "").strip()
-            if email_l and item_email == email_l:
-                return item
-            if user_id and item_user_id == user_id:
-                return item
-            if auth_key and item_auth_key == auth_key:
-                return item
-            if name and item.get("name") == name:
-                return item
-    return None
-
-
-def sub2api_import_auth_entry(
-    entry: dict,
-    email_hint: str = "",
-    merge: bool = True,
-    *,
-    token: str | None = None,
-    base_url: str | None = None,
-    cfg: dict | None = None,
-) -> dict:
-    """通过 HTTP Admin API 创建或更新 Grok OAuth 账号。"""
-    cfg = dict(cfg or get_sub2api_config())
-    credentials, name, auth_key, user_id, email = _entry_to_sub2api_credentials(entry, email_hint)
-    try:
-        group_id = int(cfg["group_id"])
-    except (TypeError, ValueError):
-        return {"ok": False, "error": "SUB2API_GROK_GROUP_ID 必须是数字", "email": email or None, "user_id": user_id or None}
-
-    base = normalize_upstream_url(base_url or cfg.get("url"))
-    if not token:
-        login = sub2api_http_login(base_url=base, cfg=cfg)
-        if not login.get("ok"):
-            return {"ok": False, "error": login.get("error") or "sub2api 登录失败", "email": email or None, "user_id": user_id or None}
-        token = login["access_token"]
-        base = login["base_url"]
-    payload = {
-        "name": name,
-        "platform": "grok",
-        "type": "oauth",
-        "group_ids": [group_id],
-        "concurrency": 1,
-        "priority": 50,
-        "rate_multiplier": 1.0,
-        "auto_pause_on_expired": True,
-        "status": "active",
-        "schedulable": True,
-        "credentials": credentials,
-    }
-    existing = sub2api_find_account(token, base, email=email, user_id=user_id, auth_key=auth_key, name=name)
-    if existing and existing.get("id") is not None:
-        if not merge:
-            return {"ok": False, "error": "sub2api 已存在相同账号", "email": email or None, "user_id": user_id or None, "id": existing["id"], "duplicate": True}
-        group_ids = existing.get("group_ids") or []
-        if isinstance(group_ids, list):
-            normalized_group_ids = []
-            for value in group_ids:
-                try:
-                    normalized_group_ids.append(int(value))
-                except (TypeError, ValueError):
-                    continue
-            if group_id not in normalized_group_ids:
-                normalized_group_ids.append(group_id)
-            if normalized_group_ids:
-                payload["group_ids"] = normalized_group_ids
-        response = sub2api_http_request(
-            "PUT",
-            f"/api/v1/admin/accounts/{existing['id']}",
-            token=token,
-            base_url=base,
-            json_body=payload,
-        )
-        if not response.get("ok"):
-            return {"ok": False, "error": response.get("error") or "更新账号失败", "email": email or None, "user_id": user_id or None}
-        data = response.get("data") if isinstance(response.get("data"), dict) else {}
-        return {"ok": True, "id": data.get("id") or existing["id"], "action": "updated", "group_id": group_id, "email": email or None, "user_id": user_id or None, "auth_key": auth_key, "expires_at": credentials.get("expires_at") or "", "has_refresh_token": bool(credentials.get("refresh_token"))}
-
-    response = sub2api_http_request(
-        "POST",
-        "/api/v1/admin/accounts",
-        token=token,
-        base_url=base,
-        json_body=payload,
-    )
-    if not response.get("ok"):
-        return {"ok": False, "error": response.get("error") or "创建账号失败", "email": email or None, "user_id": user_id or None}
-    data = response.get("data") if isinstance(response.get("data"), dict) else {}
-    return {"ok": True, "id": data.get("id"), "action": "inserted", "group_id": group_id, "email": email or None, "user_id": user_id or None, "auth_key": auth_key, "expires_at": credentials.get("expires_at") or "", "has_refresh_token": bool(credentials.get("refresh_token"))}
-
-
-def sub2api_import_sso_tokens_http(
-    sso_tokens: list[str],
-    *,
-    token: str,
-    base_url: str,
-    group_id: int,
-    emails: list[str] | None = None,
-) -> dict:
-    """批量调用 sub2api 服务端 SSO 转 OAuth 接口。"""
-    tokens = [str(value).strip() for value in (sso_tokens or []) if str(value).strip()]
-    if not tokens:
-        return {"ok": False, "error": "sso_tokens 为空", "created": [], "failed": []}
-
-    body: dict = {
-        "sso_tokens": tokens,
-        "group_ids": [int(group_id)],
-        "auto_pause_on_expired": True,
-    }
-    if emails and len(emails) == 1 and emails[0]:
-        body["name"] = emails[0]
-
-    response = sub2api_http_request(
-        "POST",
-        "/api/v1/admin/grok/sso-to-oauth",
-        token=token,
-        base_url=base_url,
-        json_body=body,
-        timeout=120,
-    )
-    if not response.get("ok"):
-        error = response.get("error") or "sso-to-oauth 失败"
-        return {
-            "ok": False,
-            "error": error,
-            "created": [],
-            "failed": [{"index": index + 1, "error": error} for index in range(len(tokens))],
-            "status_code": response.get("status_code"),
-        }
-    data = response.get("data") if isinstance(response.get("data"), dict) else {}
-    return {
-        "ok": True,
-        "created": data.get("created") if isinstance(data.get("created"), list) else [],
-        "failed": data.get("failed") if isinstance(data.get("failed"), list) else [],
-        "raw": data,
-    }
-
-
-def resolve_sub2api_grok_group(
-    *,
-    token: str,
-    base_url: str,
-    group_id: str = "",
-    group_name: str = "grok",
-) -> dict:
-    """按配置 ID 校验或按 Grok 分组名称解析实际 ID。"""
-    requested_id = (group_id or "").strip()
-    requested_name = (group_name or "").strip()
-    if requested_id and not requested_id.isdigit():
-        return {"ok": False, "error": "SUB2API_GROK_GROUP_ID 必须是数字"}
-    if not requested_name:
-        return {"ok": False, "error": "请填写 SUB2API_GROK_GROUP_NAME"}
-
-    response = sub2api_http_request(
-        "GET",
-        "/api/v1/admin/groups",
-        token=token,
-        base_url=base_url,
-        params={"platform": "grok", "page": 1, "page_size": 50},
-        timeout=15,
-    )
-    data = response.get("data") or {}
-    groups = data.get("items") if isinstance(data, dict) else []
-    if not response.get("ok") or not isinstance(groups, list):
-        return {"ok": False, "error": f"读取分组失败: {response.get('error')}"}
-
-    wanted_name = requested_name.lower()
-    group_by_name = next(
-        (
-            item
-            for item in groups
-            if isinstance(item, dict)
-            and str(item.get("name") or "").strip().lower() == wanted_name
-        ),
-        None,
-    )
-    if not requested_id:
-        if group_by_name is None:
-            return {"ok": False, "error": f"未找到 Grok 分组名称：{requested_name}"}
-        return {
-            "ok": True,
-            "group_id": int(group_by_name.get("id") or 0),
-            "group_name": group_by_name.get("name") or requested_name,
-            "group": group_by_name,
-            "resolved_by": "name",
-        }
-
-    numeric_id = int(requested_id)
-    group_by_id = next(
-        (
-            item
-            for item in groups
-            if isinstance(item, dict) and int(item.get("id") or 0) == numeric_id
-        ),
-        None,
-    )
-    if group_by_id is None and group_by_name is not None:
-        return {
-            "ok": False,
-            "error": (
-                f"分组 ID 不匹配：名称 {group_by_name.get('name')} 的实际 ID 是 "
-                f"{group_by_name.get('id')}，请更新 SUB2API_GROK_GROUP_ID"
-            ),
-        }
-    if group_by_id is None:
-        return {"ok": False, "error": f"未找到 Grok 分组 ID：{requested_id}"}
-    actual_name = str(group_by_id.get("name") or "").strip()
-    if actual_name.lower() != wanted_name:
-        return {
-            "ok": False,
-            "error": (
-                f"分组名称不匹配：ID {requested_id} 对应 {actual_name}，"
-                f"配置要求 {requested_name}"
-            ),
-        }
-    return {
-        "ok": True,
-        "group_id": numeric_id,
-        "group_name": actual_name,
-        "group": group_by_id,
-        "resolved_by": "id",
-    }
-
-
-def test_upstream_connectivity(
-    base_url: str | None = None,
-    password: str | None = None,
-    email: str | None = None,
-    cfg: dict | None = None,
-) -> dict:
-    """验证 sub2api HTTP 健康检查、管理员登录和目标分组。"""
-    import requests
-
-    cfg = dict(cfg or get_sub2api_config())
-    base = normalize_upstream_url(base_url if base_url is not None else cfg["url"])
-    if email is not None:
-        cfg["admin_email"] = email.strip()
-    if password is not None:
-        cfg["admin_password"] = password
-    if not base:
-        return {"ok": False, "message": "请先填写 SUB2API_URL"}
-    try:
-        health_response = _sub2api_http_session().get(f"{base}/health", timeout=6)
-        health = health_response.json() if health_response.status_code == 200 else None
-        if health_response.status_code != 200:
-            return {"ok": False, "message": f"sub2api 健康检查 HTTP {health_response.status_code}", "base_url": base}
-    except requests.exceptions.ConnectionError:
-        return {"ok": False, "message": f"连接 sub2api 失败: {base}", "base_url": base}
-    except requests.exceptions.Timeout:
-        return {"ok": False, "message": f"sub2api 健康检查超时: {base}", "base_url": base}
-    except Exception as exc:
-        return {"ok": False, "message": f"sub2api 健康检查异常: {exc}", "base_url": base}
-
-    login = sub2api_http_login(base_url=base, cfg=cfg)
+    login = sub2api_http_login(base_url=base, email=cfg.get("admin_email"), password=cfg.get("admin_password"), cfg=cfg)
     if not login.get("ok"):
-        return {"ok": False, "message": login.get("error") or "管理员登录失败", "base_url": base, "health": health}
-    group_result = resolve_sub2api_grok_group(
-        token=login["access_token"],
-        base_url=base,
-        group_id=cfg.get("group_id") or "",
-        group_name=cfg.get("group_name") or "grok",
-    )
-    if not group_result.get("ok"):
         return {
             "ok": False,
-            "message": group_result.get("error") or "未解析到 Grok 分组",
+            "message": login.get("error") or "管理员登录失败",
             "base_url": base,
             "health": health,
+            "health_ok": True,
+            "login_ok": False,
         }
-    group = group_result["group"]
+
+    token = login["access_token"]
+    resolved = resolve_sub2api_group(
+        token=token,
+        base_url=base or login.get("base_url") or "",
+        group_name=cfg.get("group_name"),
+        group_id=cfg.get("group_id"),
+        persist=True,
+    )
+    if not resolved.get("ok"):
+        return {
+            "ok": False,
+            "message": resolved.get("error") or "分组解析失败",
+            "base_url": base,
+            "health": health,
+            "health_ok": True,
+            "login_ok": True,
+            "groups": [
+                {"id": it.get("id"), "name": it.get("name")}
+                for it in (resolved.get("items") or [])[:20]
+            ],
+        }
+
+    gname = resolved.get("group_name") or cfg.get("group_name")
+    gid = resolved.get("group_id")
+    group = resolved.get("group") or {}
+    gplat = resolved.get("platform") or group.get("platform") or ""
     return {
         "ok": True,
         "message": (
-            f"sub2api HTTP 连通正常，已登录并可访问 Grok 分组 "
-            f"{group_result['group_name']}({group_result['group_id']})"
+            f"sub2api HTTP 连通正常，分组 {gname} → id={gid}"
+            + (f"/{gplat}" if gplat else "")
+            + "（按名称自动解析）"
         ),
         "base_url": base,
         "health": health,
+        "health_ok": True,
+        "login_ok": True,
+        "http_ok": True,
         "group": {
-            "group_id": group_result["group_id"],
-            "group_name": group_result["group_name"],
-            "platform": group.get("platform"),
-            "resolved_by": group_result["resolved_by"],
+            "group_id": gid,
+            "group_name": gname,
+            "platform": gplat,
+            "status": group.get("status"),
+            "match_by": resolved.get("match_by"),
         },
+        "groups": [
+            {"id": it.get("id"), "name": it.get("name"), "platform": it.get("platform")}
+            for it in (resolved.get("items") or [])[:30]
+        ],
     }
 
 
@@ -1184,24 +1165,22 @@ def _normalize_import_accounts(
     return out
 
 
-def _import_sso_to_upstream_legacy(
+def import_sso_to_upstream(
     sso_lines: list[str] | None = None,
     merge: bool = True,
     max_workers: int = 1,
     base_url: str | None = None,
     password: str | None = None,
+    email: str | None = None,
     accounts: list[dict] | None = None,
-    progress_cb=None,
 ) -> dict:
     """
     导入 SSO 到 sub2api 的 grok 分组（HTTP Admin API）。
 
-    流程（优先快路径）：
-    1) 若注册时已缓存可用 auth_token → 直接走 HTTP 创建/更新账号
-    2) 否则本机 device flow 换 token 后再通过 HTTP 写入
-
-    max_workers 保留参数兼容；有缓存 token 时串行 HTTP 写入即可，
-    无 token 的 device flow 仍串行（防限流）。
+    流程：
+    1) 有缓存 auth_token（注册流水线 risk 后前台换票）→ HTTP 直写 accounts
+    2) 无缓存 → 服务端 /api/v1/admin/grok/sso-to-oauth
+    3) sso-to-oauth 失败且可重试 → 本机 device flow 仅作兜底，再 HTTP 写 accounts
     """
     import time
     from grok import (
@@ -1213,56 +1192,66 @@ def _import_sso_to_upstream_legacy(
         _mark_device_flow_cooldown,
     )
 
-    def _progress(
-        *,
-        done=None,
-        total=None,
-        success=None,
-        fail=None,
-        current="",
-        phase="",
-    ):
-        if not progress_cb:
-            return
-        try:
-            progress_cb(
-                done=done,
-                total=total,
-                success=success,
-                fail=fail,
-                current=current,
-                phase=phase,
-            )
-        except Exception:
-            pass
-
-    del max_workers, password  # device flow 路径固定串行；缓存 token 路径也串行写库
+    del max_workers  # 保留参数兼容；HTTP 写串行更稳
     if base_url:
         os.environ["SUB2API_URL"] = normalize_upstream_url(base_url)
     sub2 = get_sub2api_config()
+    if email is not None and str(email).strip():
+        sub2["admin_email"] = str(email).strip()
+    if password is not None and str(password) != "":
+        sub2["admin_password"] = str(password)
 
     items = _normalize_import_accounts(sso_lines=sso_lines, accounts=accounts)
     if not items:
         return {"ok": False, "message": "没有可导入的 SSO"}
-    if not sub2.get("url") or not sub2.get("group_name"):
-        return {"ok": False, "message": "请先配置 SUB2API_URL 与 SUB2API_GROK_GROUP_NAME"}
+    if not sub2.get("url"):
+        return {"ok": False, "message": "请先配置 SUB2API_URL"}
+    if not str(sub2.get("group_name") or "").strip():
+        return {"ok": False, "message": "请先配置分组名称（SUB2API_GROK_GROUP_NAME）"}
     if not sub2.get("admin_email") or not sub2.get("admin_password"):
-        return {"ok": False, "message": "请先配置 UPSTREAM_ADMIN_EMAIL 与 UPSTREAM_ADMIN_PASSWORD"}
+        return {"ok": False, "message": "请先配置管理员邮箱与密码（UPSTREAM_ADMIN_EMAIL / PASSWORD）"}
 
     login = sub2api_http_login(cfg=sub2)
     if not login.get("ok"):
-        return {"ok": False, "message": login.get("error") or "sub2api 管理员登录失败"}
+        return {
+            "ok": False,
+            "message": login.get("error") or "sub2api 管理员登录失败",
+            "base_url": sub2.get("url"),
+        }
     api_token = login["access_token"]
-    api_base = login["base_url"]
-    group_result = resolve_sub2api_grok_group(
+    api_base = login.get("base_url") or sub2.get("url")
+
+    resolved = resolve_sub2api_group(
         token=api_token,
         base_url=api_base,
-        group_id=sub2.get("group_id") or "",
-        group_name=sub2.get("group_name") or "grok",
+        group_name=sub2.get("group_name"),
+        group_id=sub2.get("group_id"),
+        persist=True,
     )
-    if not group_result.get("ok"):
-        return {"ok": False, "message": group_result.get("error") or "未解析到 sub2api Grok 分组"}
-    sub2["group_id"] = str(group_result["group_id"])
+    if not resolved.get("ok"):
+        return {
+            "ok": False,
+            "message": resolved.get("error") or "分组名称未能解析到 ID",
+            "base_url": api_base,
+            "group_name": sub2.get("group_name"),
+        }
+    group_id = int(resolved["group_id"])
+    sub2["group_id"] = str(group_id)
+    if resolved.get("group_name"):
+        sub2["group_name"] = str(resolved["group_name"])
+    gplat = resolved.get("platform") or ""
+    logs.emit(
+        f"sub2api 分组解析: {sub2.get('group_name')} → id={group_id}"
+        + (f"/{gplat}" if gplat else "")
+        + f"（by {resolved.get('match_by') or 'name'}）",
+        "info",
+    )
+    if gplat and gplat.lower() != "grok":
+        logs.emit(
+            f"提示：目标分组 platform={gplat}（非 grok）。Grok 账号仍可写入该 group_ids，"
+            "若 sub2api 侧有平台校验失败再换回 grok 分组。",
+            "warn",
+        )
 
     results_by_idx: dict[int, dict] = {}
     imported: list[dict] = []
@@ -1270,7 +1259,7 @@ def _import_sso_to_upstream_legacy(
     fail_count = 0
     cached_hits = 0
     flow_hits = 0
-    _progress(done=0, total=len(items), success=0, fail=0, phase="start")
+    sso_api_hits = 0
 
     def _write_token_to_sub2api(entry: dict, email_hint: str, idx: int) -> dict:
         item: dict = {
@@ -1311,10 +1300,14 @@ def _import_sso_to_upstream_legacy(
         flow = None
         last_flow_err = "本机 device flow 失败"
         for attempt in range(1, max_attempts + 1):
-            flow = sso_device_flow_to_token(sso, timeout=28)
+            # 导入必须真正换票；覆盖全局诊断开关 GROK_DEVICE_FLOW_ISSUE_TOKEN=0
+            flow = sso_device_flow_to_token(sso, timeout=28, issue_token=True)
             if flow.get("ok") and flow.get("token"):
                 return flow, None
-            last_flow_err = flow.get("error") or last_flow_err
+            if flow.get("ok") and not flow.get("token"):
+                last_flow_err = flow.get("note") or "device approve 成功但未下发 token"
+            else:
+                last_flow_err = flow.get("error") or last_flow_err
             if "会话无效" in str(last_flow_err) or "非有效 JWT" in str(last_flow_err):
                 break
             kind = _device_flow_error_kind(str(last_flow_err))
@@ -1330,328 +1323,7 @@ def _import_sso_to_upstream_legacy(
                 time.sleep(wait)
         return None, last_flow_err
 
-    def _run_one(
-        idx: int,
-        email_hint: str,
-        sso: str,
-        auth_token: dict | None,
-        *,
-        pass_label: str,
-        max_attempts: int,
-        prefer_cached: bool = True,
-    ) -> dict:
-        nonlocal cached_hits, flow_hits
-        item: dict = {
-            "index": idx,
-            "email": email_hint or None,
-            "sso_hint": (sso[:12] + "...") if len(sso) > 12 else sso,
-        }
-        token = None
-        used_cached = False
-
-        # 快路径：注册时已缓存且未过期的 token，直接写 sub2api
-        if prefer_cached and is_auth_token_usable(auth_token):
-            token = auth_token
-            used_cached = True
-        else:
-            flow, last_flow_err = _device_flow_to_token(
-                sso, idx, pass_label=pass_label, max_attempts=max_attempts
-            )
-            if not flow or not flow.get("token"):
-                item["status"] = "failed"
-                item["error"] = last_flow_err or "本机 device flow 失败（SSO 不可导入）"
-                item["retryable"] = _device_flow_error_kind(str(last_flow_err)) != "invalid"
-                item["via"] = "device_flow"
-                return item
-            token = flow["token"]
-
-        entry = token_to_auth_entry(token, email=email_hint or "")
-        written = _write_token_to_sub2api(entry, email_hint or "", idx)
-        written["sso_hint"] = item["sso_hint"]
-        written["via"] = "cached_token" if used_cached else "device_flow"
-        if used_cached:
-            cached_hits += 1
-        else:
-            flow_hits += 1
-        if not written.get("email"):
-            written["email"] = email_hint or None
-        return written
-
-    cached_ready = sum(1 for it in items if is_auth_token_usable(it.get("auth_token")))
-    if cached_ready:
-        logs.emit(
-            f"sub2api 导入：{len(items)} 条中 {cached_ready} 条已有缓存 token，优先直写（跳过 device flow）",
-            "info",
-        )
-
-    # —— 第一轮：优先缓存 token 直写；无缓存再 device flow ——
-    need_flow_gap = False  # 仅在刚跑过 device flow 后才拉间隔
-    for idx, acc in enumerate(items, 1):
-        email_hint = acc.get("email") or ""
-        sso = acc.get("sso") or ""
-        auth_token = acc.get("auth_token")
-        has_cached = is_auth_token_usable(auth_token)
-        label = email_hint or ((sso[:12] + "…") if sso else f"#{idx}")
-        _progress(
-            done=idx - 1,
-            total=len(items),
-            success=ok_count,
-            fail=fail_count,
-            current=label,
-            phase="import",
-        )
-
-        # 有缓存：几乎无间隔；无缓存且上一条也走了 flow：防限流 sleep
-        if idx > 1 and need_flow_gap and not has_cached:
-            time.sleep(5.0)
-
-        try:
-            item = _run_one(
-                idx,
-                email_hint,
-                sso,
-                auth_token if isinstance(auth_token, dict) else None,
-                pass_label="",
-                max_attempts=5,
-                prefer_cached=True,
-            )
-        except Exception as e:
-            item = {
-                "index": idx,
-                "email": email_hint or None,
-                "status": "failed",
-                "error": f"导入异常: {e}",
-                "retryable": True,
-                "via": "error",
-            }
-            logs.emit(f"sub2api 导入 [{idx}/{len(items)}] 异常: {e}", "error")
-
-        need_flow_gap = item.get("via") == "device_flow"
-        results_by_idx[idx] = item
-        via_tag = item.get("via") or "?"
-        if item.get("status") == "ok":
-            ok_count += 1
-            imported.append(
-                {
-                    "id": item.get("account_id"),
-                    "email": item.get("email"),
-                    "user_id": item.get("user_id"),
-                    "expires_at": item.get("expires_at"),
-                    "has_refresh_token": item.get("has_refresh_token"),
-                }
-            )
-            logs.emit(
-                f"sub2api 导入 [{idx}/{len(items)}] 成功({via_tag}): "
-                f"{item.get('email') or item.get('user_id') or 'ok'}",
-                "success",
-            )
-        else:
-            fail_count += 1
-            logs.emit(
-                f"sub2api 导入 [{idx}/{len(items)}] 失败({via_tag}): {item.get('error')}",
-                "warn",
-            )
-            if _device_flow_error_kind(str(item.get("error") or "")) in (
-                "rate_limited",
-                "timeout",
-                "tls",
-            ):
-                time.sleep(4.0)
-        _progress(
-            done=idx,
-            total=len(items),
-            success=ok_count,
-            fail=fail_count,
-            current=label,
-            phase="import",
-        )
-
-    # —— 第二轮：仅对「可重试」失败项再跑 device flow（冷却后抢救） ——
-    retry_list = [
-        (idx, items[idx - 1].get("email") or "", items[idx - 1].get("sso") or "")
-        for idx in range(1, len(items) + 1)
-        if results_by_idx.get(idx, {}).get("status") == "failed"
-        and results_by_idx[idx].get("retryable", True)
-        and _device_flow_error_kind(str(results_by_idx[idx].get("error") or ""))
-        in ("rate_limited", "timeout", "tls", "device_code", "token_poll", "other")
-    ]
-    if retry_list:
-        cool = 25.0
-        logs.emit(
-            f"sub2api 导入：第一轮 {ok_count} 成功 / {fail_count} 失败，"
-            f"冷却 {cool:.0f}s 后抢救 {len(retry_list)} 条…",
-            "info",
-        )
-        _progress(
-            done=len(items),
-            total=len(items),
-            success=ok_count,
-            fail=fail_count,
-            current=f"冷却 {cool:.0f}s 后抢救 {len(retry_list)} 条",
-            phase="retry_cooldown",
-        )
-        _mark_device_flow_cooldown(cool)
-        time.sleep(cool)
-        for j, (idx, email_hint, sso) in enumerate(retry_list):
-            label = email_hint or (sso[:12] + "…") if sso else f"#{idx}"
-            _progress(
-                done=len(items),
-                total=len(items),
-                success=ok_count,
-                fail=fail_count,
-                current=f"抢救 {j + 1}/{len(retry_list)}: {label}",
-                phase="retry",
-            )
-            if j > 0:
-                time.sleep(8.0)
-            try:
-                item = _run_one(
-                    idx,
-                    email_hint,
-                    sso,
-                    None,  # 抢救轮强制重新 device flow
-                    pass_label="·抢救",
-                    max_attempts=4,
-                    prefer_cached=False,
-                )
-            except Exception as e:
-                item = {
-                    "index": idx,
-                    "email": email_hint or None,
-                    "status": "failed",
-                    "error": f"抢救异常: {e}",
-                }
-            if item.get("status") == "ok":
-                # 失败 → 成功：修正计数
-                fail_count = max(0, fail_count - 1)
-                ok_count += 1
-                results_by_idx[idx] = item
-                imported.append(
-                    {
-                        "id": item.get("account_id"),
-                        "email": item.get("email"),
-                        "user_id": item.get("user_id"),
-                        "expires_at": item.get("expires_at"),
-                        "has_refresh_token": item.get("has_refresh_token"),
-                    }
-                )
-                logs.emit(
-                    f"sub2api 导入·抢救 [{idx}/{len(items)}] 成功: "
-                    f"{item.get('email') or item.get('user_id') or 'ok'}",
-                    "success",
-                )
-            else:
-                results_by_idx[idx] = item
-                logs.emit(
-                    f"sub2api 导入·抢救 [{idx}/{len(items)}] 仍失败: {item.get('error')}",
-                    "warn",
-                )
-            _progress(
-                done=len(items),
-                total=len(items),
-                success=ok_count,
-                fail=fail_count,
-                current=f"抢救 {j + 1}/{len(retry_list)}: {label}",
-                phase="retry",
-            )
-
-    results = [results_by_idx[i] for i in sorted(results_by_idx)]
-    msg = (
-        f"SSO 导入 sub2api 完成：{ok_count} 成功, {fail_count} 失败"
-        f"（缓存直写 {cached_hits}，device flow {flow_hits}）"
-    )
-    return {
-        "ok": fail_count == 0 and ok_count > 0,
-        "message": msg,
-        "success": ok_count,
-        "fail": fail_count,
-        "total": len(items),
-        "cached_hits": cached_hits,
-        "flow_hits": flow_hits,
-        "results": results,
-        "imported": imported,
-        "base_url": api_base,
-        "group_id": sub2.get("group_id"),
-        "group_name": sub2.get("group_name"),
-        "mode": "cached_token_or_device_flow_then_sub2api_http",
-    }
-
-def import_sso_to_upstream(
-    sso_lines: list[str] | None = None,
-    merge: bool = True,
-    max_workers: int = 1,
-    base_url: str | None = None,
-    password: str | None = None,
-    accounts: list[dict] | None = None,
-    progress_cb=None,
-) -> dict:
-    """批量导入 SSO：缓存 token 直写 -> 服务端转换 -> 本机兜底。"""
-    import time
-    from grok import (
-        _device_flow_error_kind,
-        _device_flow_wait_seconds,
-        _mark_device_flow_cooldown,
-        is_auth_token_usable,
-        sso_device_flow_to_token,
-        token_to_auth_entry,
-    )
-
-    del max_workers, password
-    if base_url:
-        os.environ["SUB2API_URL"] = normalize_upstream_url(base_url)
-    sub2 = get_sub2api_config()
-    items = _normalize_import_accounts(sso_lines=sso_lines, accounts=accounts)
-    if not items:
-        return {"ok": False, "message": "没有可导入的 SSO"}
-    if not sub2.get("url") or not sub2.get("group_name"):
-        return {"ok": False, "message": "请先配置 SUB2API_URL 与 SUB2API_GROK_GROUP_NAME"}
-    if not sub2.get("admin_email") or not sub2.get("admin_password"):
-        return {"ok": False, "message": "请先配置 UPSTREAM_ADMIN_EMAIL 与 UPSTREAM_ADMIN_PASSWORD"}
-
-    login = sub2api_http_login(cfg=sub2)
-    if not login.get("ok"):
-        return {"ok": False, "message": login.get("error") or "sub2api 管理员登录失败"}
-    api_token = login["access_token"]
-    api_base = login["base_url"]
-    group_result = resolve_sub2api_grok_group(
-        token=api_token,
-        base_url=api_base,
-        group_id=sub2.get("group_id") or "",
-        group_name=sub2.get("group_name") or "grok",
-    )
-    if not group_result.get("ok"):
-        return {"ok": False, "message": group_result.get("error") or "未解析到 sub2api Grok 分组"}
-    group_id = int(group_result["group_id"])
-    sub2["group_id"] = str(group_id)
-
-    total = len(items)
-    results_by_idx: dict[int, dict] = {}
-    imported: list[dict] = []
-    ok_count = 0
-    fail_count = 0
-    cached_hits = 0
-    sso_api_hits = 0
-    flow_hits = 0
-
-    def _progress(*, current: str = "", phase: str = "") -> None:
-        if not progress_cb:
-            return
-        try:
-            progress_cb(
-                done=len(results_by_idx),
-                total=total,
-                success=ok_count,
-                fail=fail_count,
-                current=current,
-                phase=phase,
-            )
-        except Exception:
-            pass
-
-    def _sso_hint(sso: str) -> str:
-        return (sso[:12] + "...") if len(sso) > 12 else sso
-
-    def _record_success(item: dict) -> None:
+    def _mark_ok(item: dict) -> None:
         nonlocal ok_count
         ok_count += 1
         imported.append(
@@ -1664,242 +1336,304 @@ def import_sso_to_upstream(
             }
         )
 
-    def _write_auth_entry(entry: dict, email_hint: str, index: int) -> dict:
-        data = sub2api_import_auth_entry(
-            entry,
-            email_hint=email_hint,
-            merge=merge,
-            token=api_token,
-            base_url=api_base,
-            cfg=sub2,
+    # —— 路径 A：有缓存 token（注册时 CLEAN 后已换票）→ HTTP 直写 accounts ——
+    need_sso_indices: list[int] = []
+    cached_ready = sum(1 for it in items if is_auth_token_usable(it.get("auth_token")))
+    if cached_ready:
+        logs.emit(
+            f"sub2api 导入：{len(items)} 条中 {cached_ready} 条已有注册缓存 token，优先直写（不换票）",
+            "info",
         )
-        if not data.get("ok"):
-            return {
-                "index": index,
-                "email": data.get("email") or email_hint or None,
-                "status": "failed",
-                "error": data.get("error") or "sub2api 写入失败",
-                "user_id": data.get("user_id") or entry.get("user_id"),
-                "retryable": False,
-            }
-        return {
-            "index": index,
-            "email": data.get("email") or email_hint or entry.get("email") or None,
-            "status": "ok",
-            "account_id": data.get("id"),
-            "action": data.get("action"),
-            "group_id": data.get("group_id"),
-            "user_id": data.get("user_id") or entry.get("user_id"),
-            "expires_at": data.get("expires_at") or entry.get("expires_at"),
-            "has_refresh_token": bool(data.get("has_refresh_token")),
-        }
+    elif items:
+        logs.emit(
+            f"sub2api 导入：{len(items)} 条无可用缓存 token，走 sso-to-oauth；本机换票仅兜底",
+            "info",
+        )
 
-    def _device_flow(sso: str, index: int) -> tuple[dict | None, str]:
-        last_error = "本机 device flow 失败"
-        for attempt in range(1, 5):
-            flow = sso_device_flow_to_token(sso, timeout=28)
-            if flow.get("ok") and flow.get("token"):
-                return flow, ""
-            last_error = flow.get("error") or last_error
-            if _device_flow_error_kind(str(last_error)) == "invalid":
-                break
-            if attempt < 4:
-                wait = _device_flow_wait_seconds(str(last_error), attempt)
-                if _device_flow_error_kind(str(last_error)) == "rate_limited":
-                    _mark_device_flow_cooldown(wait)
+    for idx, acc in enumerate(items, 1):
+        email_hint = acc.get("email") or ""
+        sso = acc.get("sso") or ""
+        auth_token = acc.get("auth_token") if isinstance(acc.get("auth_token"), dict) else None
+        sso_hint = (sso[:12] + "...") if len(sso) > 12 else sso
+
+        if is_auth_token_usable(auth_token):
+            try:
+                entry = token_to_auth_entry(auth_token, email=email_hint or "")
+                item = _write_token_to_sub2api(entry, email_hint or "", idx)
+                item["sso_hint"] = sso_hint
+                item["via"] = "cached_token_http"
+                if item.get("status") == "ok":
+                    cached_hits += 1
+                    _mark_ok(item)
+                    logs.emit(
+                        f"sub2api 导入 [{idx}/{len(items)}] 成功(cached_token_http): "
+                        f"{item.get('email') or item.get('user_id') or 'ok'}",
+                        "success",
+                    )
+                else:
+                    fail_count += 1
+                    logs.emit(
+                        f"sub2api 导入 [{idx}/{len(items)}] 失败(cached_token_http): {item.get('error')}",
+                        "warn",
+                    )
+                results_by_idx[idx] = item
+            except Exception as e:
+                fail_count += 1
+                item = {
+                    "index": idx,
+                    "email": email_hint or None,
+                    "sso_hint": sso_hint,
+                    "status": "failed",
+                    "error": f"导入异常: {e}",
+                    "retryable": True,
+                    "via": "error",
+                }
+                results_by_idx[idx] = item
+                logs.emit(f"sub2api 导入 [{idx}/{len(items)}] 异常: {e}", "error")
+        else:
+            need_sso_indices.append(idx)
+
+    # —— 路径 B：无缓存 → 服务端 sso-to-oauth（批量，服务端自己换票） ——
+    if need_sso_indices:
+        sso_list = [items[i - 1].get("sso") or "" for i in need_sso_indices]
+        email_list = [items[i - 1].get("email") or "" for i in need_sso_indices]
+        logs.emit(
+            f"sub2api HTTP 导入：{len(need_sso_indices)} 条走服务端 sso-to-oauth…",
+            "info",
+        )
+        # 分批，避免一次塞太多
+        batch_size = 20
+        for batch_start in range(0, len(need_sso_indices), batch_size):
+            batch_idxs = need_sso_indices[batch_start : batch_start + batch_size]
+            batch_tokens = [items[i - 1].get("sso") or "" for i in batch_idxs]
+            batch_emails = [items[i - 1].get("email") or "" for i in batch_idxs]
+            api_result = sub2api_import_sso_tokens_http(
+                batch_tokens,
+                token=api_token,
+                base_url=api_base,
+                group_id=group_id,
+                emails=batch_emails if len(batch_emails) == 1 else None,
+            )
+
+            # 建立 index(1-based in batch) -> result
+            created_by_index: dict[int, dict] = {}
+            failed_by_index: dict[int, str] = {}
+            if api_result.get("ok"):
+                for c in api_result.get("created") or []:
+                    if not isinstance(c, dict):
+                        continue
+                    # created 可能是账号对象或 {index, ...}
+                    ci = c.get("index")
+                    if ci is None and c.get("id") is not None:
+                        # 无 index 时按顺序不好对齐，先跳过 index 映射，后面按失败列表补
+                        pass
+                    if ci is not None:
+                        try:
+                            created_by_index[int(ci)] = c
+                        except (TypeError, ValueError):
+                            pass
+                # 若 created 无 index 字段，按返回顺序对齐成功数
+                if not created_by_index and api_result.get("created"):
+                    created_list = [c for c in api_result["created"] if isinstance(c, dict)]
+                    failed_set = set()
+                    for f in api_result.get("failed") or []:
+                        if isinstance(f, dict) and f.get("index") is not None:
+                            try:
+                                failed_set.add(int(f["index"]))
+                            except (TypeError, ValueError):
+                                pass
+                    # 1-based batch positions not in failed → success in order
+                    success_slots = [i for i in range(1, len(batch_idxs) + 1) if i not in failed_set]
+                    for slot, c in zip(success_slots, created_list):
+                        created_by_index[slot] = c
+
+                for f in api_result.get("failed") or []:
+                    if not isinstance(f, dict):
+                        continue
+                    fi = f.get("index")
+                    if fi is None:
+                        continue
+                    try:
+                        failed_by_index[int(fi)] = str(f.get("error") or "sso-to-oauth failed")
+                    except (TypeError, ValueError):
+                        pass
+            else:
+                # 整批失败：全部标记，后面可走 device flow 兜底
+                err = api_result.get("error") or "sso-to-oauth 请求失败"
+                for bi, idx in enumerate(batch_idxs, 1):
+                    failed_by_index[bi] = err
+
+            for bi, idx in enumerate(batch_idxs, 1):
+                email_hint = items[idx - 1].get("email") or ""
+                sso = items[idx - 1].get("sso") or ""
+                sso_hint = (sso[:12] + "...") if len(sso) > 12 else sso
+                if bi in created_by_index:
+                    c = created_by_index[bi]
+                    acc = c.get("account") if isinstance(c.get("account"), dict) else (
+                        c.get("_account") if isinstance(c.get("_account"), dict) else {}
+                    )
+                    cred = c.get("credentials") if isinstance(c.get("credentials"), dict) else {}
+                    if not cred and isinstance(acc.get("credentials"), dict):
+                        cred = acc["credentials"]
+                    account_id = c.get("id") if c.get("id") is not None else acc.get("id")
+                    email_out = (
+                        email_hint
+                        or c.get("email")
+                        or cred.get("email")
+                        or acc.get("name")
+                        or c.get("name")
+                        or None
+                    )
+                    item = {
+                        "index": idx,
+                        "email": email_out,
+                        "sso_hint": sso_hint,
+                        "status": "ok",
+                        "account_id": account_id,
+                        "action": "sso_to_oauth",
+                        "group_id": group_id,
+                        "user_id": cred.get("user_id")
+                        or cred.get("sub")
+                        or c.get("user_id")
+                        or acc.get("user_id"),
+                        "expires_at": cred.get("expires_at")
+                        or c.get("expires_at")
+                        or acc.get("expires_at"),
+                        "has_refresh_token": bool(
+                            cred.get("refresh_token")
+                            or (acc.get("credentials_status") or {}).get("has_refresh_token")
+                        ),
+                        "via": "sso_to_oauth_http",
+                    }
+                    sso_api_hits += 1
+                    _mark_ok(item)
+                    results_by_idx[idx] = item
+                    logs.emit(
+                        f"sub2api 导入 [{idx}/{len(items)}] 成功(sso_to_oauth_http): "
+                        f"{item.get('email') or item.get('user_id') or 'ok'}"
+                        f" · id={account_id} · group={group_id}",
+                        "success",
+                    )
+                else:
+                    err = failed_by_index.get(bi) or "sso-to-oauth 未返回成功"
+                    # 无效 SSO 不重试；限流/超时等可走本机 device flow
+                    err_l = err.lower()
+                    invalid = (
+                        "unauthorized" in err_l
+                        or "invalid" in err_l
+                        or "expired" in err_l
+                        or "会话无效" in err
+                        or "非有效" in err
+                    )
+                    item = {
+                        "index": idx,
+                        "email": email_hint or None,
+                        "sso_hint": sso_hint,
+                        "status": "failed",
+                        "error": err,
+                        "retryable": not invalid,
+                        "via": "sso_to_oauth_http",
+                    }
+                    results_by_idx[idx] = item
+                    fail_count += 1
+                    logs.emit(
+                        f"sub2api 导入 [{idx}/{len(items)}] 失败(sso_to_oauth_http): {err}",
+                        "warn",
+                    )
+
+    # —— 路径 C：sso-to-oauth 可重试失败 → 本机 device flow 兜底 + HTTP 写 accounts ——
+    retry_list = [
+        idx
+        for idx in range(1, len(items) + 1)
+        if results_by_idx.get(idx, {}).get("status") == "failed"
+        and results_by_idx[idx].get("retryable", False)
+        and results_by_idx[idx].get("via") == "sso_to_oauth_http"
+    ]
+    if retry_list:
+        logs.emit(
+            f"sub2api 导入：sso-to-oauth 后 {len(retry_list)} 条可重试，"
+            f"启用本机 device flow 兜底换票…",
+            "warn",
+        )
+        for j, idx in enumerate(retry_list):
+            if j > 0:
+                time.sleep(5.0)
+            email_hint = items[idx - 1].get("email") or ""
+            sso = items[idx - 1].get("sso") or ""
+            sso_hint = (sso[:12] + "...") if len(sso) > 12 else sso
+            flow, last_flow_err = _device_flow_to_token(
+                sso, idx, pass_label="·兜底", max_attempts=4
+            )
+            if not flow or not flow.get("token"):
+                item = {
+                    "index": idx,
+                    "email": email_hint or None,
+                    "sso_hint": sso_hint,
+                    "status": "failed",
+                    "error": last_flow_err or "本机 device flow 失败",
+                    "via": "device_flow_http",
+                }
+                results_by_idx[idx] = item
                 logs.emit(
-                    f"sub2api 兜底 [{index}/{total}] device flow 重试 {attempt}/4，等待 {wait:.0f}s…",
+                    f"sub2api 导入·兜底 [{idx}/{len(items)}] 仍失败: {item.get('error')}",
                     "warn",
                 )
-                time.sleep(wait)
-        return None, last_error
-
-    def _retryable_sso_error(error: str) -> bool:
-        text = (error or "").lower()
-        return not any(marker in text for marker in ("unauthorized", "invalid", "expired", "会话无效", "非有效"))
-
-    _progress(phase="start")
-    pending_sso_indices: list[int] = []
-
-    # 路径 A：可用缓存 token 直接写入 accounts。
-    for index, account in enumerate(items, 1):
-        email_hint = account.get("email") or ""
-        sso = account.get("sso") or ""
-        auth_token = account.get("auth_token") if isinstance(account.get("auth_token"), dict) else None
-        if not is_auth_token_usable(auth_token):
-            pending_sso_indices.append(index)
-            continue
-        _progress(current=email_hint or _sso_hint(sso), phase="cached_token")
-        try:
-            item = _write_auth_entry(token_to_auth_entry(auth_token, email=email_hint), email_hint, index)
-            item["sso_hint"] = _sso_hint(sso)
-            item["via"] = "cached_token_http"
-        except Exception as exc:
-            item = {
-                "index": index,
-                "email": email_hint or None,
-                "sso_hint": _sso_hint(sso),
-                "status": "failed",
-                "error": f"缓存 token 导入异常: {exc}",
-                "retryable": False,
-                "via": "cached_token_http",
-            }
-        results_by_idx[index] = item
-        if item.get("status") == "ok":
-            cached_hits += 1
-            _record_success(item)
-        else:
-            fail_count += 1
-        _progress(current=email_hint or _sso_hint(sso), phase="cached_token")
-
-    # 路径 B：无缓存 token 的 SSO 每 20 条交给 sub2api 服务端转换。
-    batch_size = 20
-    for start in range(0, len(pending_sso_indices), batch_size):
-        batch_indices = pending_sso_indices[start : start + batch_size]
-        batch_tokens = [items[index - 1].get("sso") or "" for index in batch_indices]
-        batch_emails = [items[index - 1].get("email") or "" for index in batch_indices]
-        _progress(current=f"服务端转换 {start + 1}-{start + len(batch_indices)}", phase="sso_to_oauth")
-        api_result = sub2api_import_sso_tokens_http(
-            batch_tokens,
-            token=api_token,
-            base_url=api_base,
-            group_id=group_id,
-            emails=batch_emails if len(batch_emails) == 1 else None,
-        )
-        created_by_index: dict[int, dict] = {}
-        failed_by_index: dict[int, str] = {}
-        if api_result.get("ok"):
-            for created in api_result.get("created") or []:
-                if not isinstance(created, dict) or created.get("index") is None:
-                    continue
-                try:
-                    created_by_index[int(created["index"])] = created
-                except (TypeError, ValueError):
-                    pass
-            for failed in api_result.get("failed") or []:
-                if not isinstance(failed, dict) or failed.get("index") is None:
-                    continue
-                try:
-                    failed_by_index[int(failed["index"])] = str(failed.get("error") or "sso-to-oauth 失败")
-                except (TypeError, ValueError):
-                    pass
-            if not created_by_index:
-                created_items = [item for item in api_result.get("created") or [] if isinstance(item, dict)]
-                success_slots = [slot for slot in range(1, len(batch_indices) + 1) if slot not in failed_by_index]
-                for slot, created in zip(success_slots, created_items):
-                    created_by_index[slot] = created
-        else:
-            error = api_result.get("error") or "sso-to-oauth 请求失败"
-            failed_by_index = {slot: error for slot in range(1, len(batch_indices) + 1)}
-
-        for slot, index in enumerate(batch_indices, 1):
-            account = items[index - 1]
-            email_hint = account.get("email") or ""
-            sso = account.get("sso") or ""
-            if slot in created_by_index:
-                created = created_by_index[slot]
-                credentials = created.get("credentials") if isinstance(created.get("credentials"), dict) else {}
-                item = {
-                    "index": index,
-                    "email": email_hint or credentials.get("email") or created.get("name") or None,
-                    "sso_hint": _sso_hint(sso),
-                    "status": "ok",
-                    "account_id": created.get("id"),
-                    "action": "sso_to_oauth",
-                    "group_id": group_id,
-                    "user_id": credentials.get("user_id") or created.get("user_id"),
-                    "expires_at": credentials.get("expires_at") or created.get("expires_at"),
-                    "has_refresh_token": bool(credentials.get("refresh_token")),
-                    "via": "sso_to_oauth_http",
-                }
-                results_by_idx[index] = item
-                sso_api_hits += 1
-                _record_success(item)
-            else:
-                error = failed_by_index.get(slot) or "sso-to-oauth 未返回成功"
-                results_by_idx[index] = {
-                    "index": index,
+                continue
+            try:
+                entry = token_to_auth_entry(flow["token"], email=email_hint or "")
+                item = _write_token_to_sub2api(entry, email_hint or "", idx)
+                item["sso_hint"] = sso_hint
+                item["via"] = "device_flow_http"
+                if item.get("status") == "ok":
+                    flow_hits += 1
+                    fail_count = max(0, fail_count - 1)
+                    _mark_ok(item)
+                    results_by_idx[idx] = item
+                    logs.emit(
+                        f"sub2api 导入·兜底 [{idx}/{len(items)}] 成功(device_flow_http): "
+                        f"{item.get('email') or item.get('user_id') or 'ok'}",
+                        "success",
+                    )
+                else:
+                    results_by_idx[idx] = item
+                    logs.emit(
+                        f"sub2api 导入·兜底 [{idx}/{len(items)}] 写库失败: {item.get('error')}",
+                        "warn",
+                    )
+            except Exception as e:
+                results_by_idx[idx] = {
+                    "index": idx,
                     "email": email_hint or None,
-                    "sso_hint": _sso_hint(sso),
+                    "sso_hint": sso_hint,
                     "status": "failed",
-                    "error": error,
-                    "retryable": _retryable_sso_error(error),
-                    "via": "sso_to_oauth_http",
+                    "error": f"兜底异常: {e}",
+                    "via": "device_flow_http",
                 }
-                fail_count += 1
-        _progress(current=f"服务端转换 {start + 1}-{start + len(batch_indices)}", phase="sso_to_oauth")
+                logs.emit(f"sub2api 导入·兜底 [{idx}/{len(items)}] 异常: {e}", "error")
 
-    # 路径 C：服务端转换的可重试失败，才回退本机 device flow。
-    retry_indices = [
-        index
-        for index, item in results_by_idx.items()
-        if item.get("status") == "failed"
-        and item.get("via") == "sso_to_oauth_http"
-        and item.get("retryable")
-    ]
-    for position, index in enumerate(retry_indices, 1):
-        account = items[index - 1]
-        email_hint = account.get("email") or ""
-        sso = account.get("sso") or ""
-        if position > 1:
-            time.sleep(5)
-        _progress(current=f"兜底 {position}/{len(retry_indices)}: {email_hint or _sso_hint(sso)}", phase="retry")
-        flow, flow_error = _device_flow(sso, index)
-        if not flow or not flow.get("token"):
-            results_by_idx[index] = {
-                "index": index,
-                "email": email_hint or None,
-                "sso_hint": _sso_hint(sso),
-                "status": "failed",
-                "error": flow_error or "本机 device flow 失败",
-                "retryable": _device_flow_error_kind(str(flow_error)) != "invalid",
-                "via": "device_flow_http",
-            }
-            continue
-        try:
-            item = _write_auth_entry(token_to_auth_entry(flow["token"], email=email_hint), email_hint, index)
-            item["sso_hint"] = _sso_hint(sso)
-            item["via"] = "device_flow_http"
-        except Exception as exc:
-            item = {
-                "index": index,
-                "email": email_hint or None,
-                "sso_hint": _sso_hint(sso),
-                "status": "failed",
-                "error": f"device flow 兜底异常: {exc}",
-                "retryable": True,
-                "via": "device_flow_http",
-            }
-        results_by_idx[index] = item
-        if item.get("status") == "ok":
-            fail_count = max(0, fail_count - 1)
-            flow_hits += 1
-            _record_success(item)
-        _progress(current=f"兜底 {position}/{len(retry_indices)}: {email_hint or _sso_hint(sso)}", phase="retry")
-
-    for index, account in enumerate(items, 1):
-        if index not in results_by_idx:
+    # 补全未处理 index（理论上不应有）
+    for idx in range(1, len(items) + 1):
+        if idx not in results_by_idx:
             fail_count += 1
-            results_by_idx[index] = {
-                "index": index,
-                "email": account.get("email") or None,
+            results_by_idx[idx] = {
+                "index": idx,
+                "email": items[idx - 1].get("email") or None,
                 "status": "failed",
                 "error": "未处理",
-                "retryable": True,
                 "via": "error",
             }
 
-    results = [results_by_idx[index] for index in sorted(results_by_idx)]
-    message = (
-        f"SSO 导入 sub2api 完成：{ok_count} 成功，{fail_count} 失败"
-        f"（缓存直写 {cached_hits}，服务端转换 {sso_api_hits}，device flow {flow_hits}）"
+    results = [results_by_idx[i] for i in sorted(results_by_idx)]
+    msg = (
+        f"SSO 导入 sub2api(HTTP) 完成：{ok_count} 成功, {fail_count} 失败"
+        f"（缓存直写 {cached_hits}，sso-to-oauth {sso_api_hits}，device flow {flow_hits}）"
     )
     return {
         "ok": fail_count == 0 and ok_count > 0,
-        "message": message,
+        "message": msg,
         "success": ok_count,
         "fail": fail_count,
-        "total": total,
+        "total": len(items),
         "cached_hits": cached_hits,
         "sso_api_hits": sso_api_hits,
         "flow_hits": flow_hits,
@@ -1907,10 +1641,9 @@ def import_sso_to_upstream(
         "imported": imported,
         "base_url": api_base,
         "group_id": str(group_id),
-        "group_name": group_result["group_name"],
-        "mode": "cached_token_or_sso_to_oauth_then_device_flow",
+        "group_name": sub2.get("group_name"),
+        "mode": "http_admin_api",
     }
-
 
 def mask_secret(value: str, keep: int = 4) -> str:
     if not value:
@@ -1934,24 +1667,11 @@ def health():
 def status():
     data = engine.get_status()
     data["env"] = env_snapshot()
-    job = get_import_job_public()
-    # 导入刚结束时把 recent_success 一并带回，前端可立刻刷新「已导入」标记
-    if job.get("status") in ("done", "error") and not job.get("running"):
-        job["recent_success"] = data.get("recent_success", [])
-    data["import_job"] = job
     try:
         data["solver"] = solver_manager.status()
     except Exception as e:
         data["solver"] = {"ready": False, "message": f"状态读取失败: {e}"}
     return jsonify(data)
-
-
-@app.get("/api/upstream/import/status")
-def upstream_import_status():
-    job = get_import_job_public()
-    if job.get("status") in ("done", "error") and not job.get("running"):
-        job["recent_success"] = engine.get_status().get("recent_success", [])
-    return jsonify({"ok": True, **job})
 
 
 @app.get("/api/config")
@@ -1974,6 +1694,12 @@ def get_config():
             "UI_HOST": cfg.get("UI_HOST", DEFAULTS["UI_HOST"]),
             "UI_PORT": cfg.get("UI_PORT", DEFAULTS["UI_PORT"]),
             "SUB2API_URL": cfg.get("SUB2API_URL", cfg.get("UPSTREAM_URL", DEFAULTS["SUB2API_URL"])),
+            "SUB2API_DOCKER_CONTAINER": cfg.get("SUB2API_DOCKER_CONTAINER", DEFAULTS["SUB2API_DOCKER_CONTAINER"]),
+            "SUB2API_DB_HOST": cfg.get("SUB2API_DB_HOST", DEFAULTS["SUB2API_DB_HOST"]),
+            "SUB2API_DB_PORT": cfg.get("SUB2API_DB_PORT", DEFAULTS["SUB2API_DB_PORT"]),
+            "SUB2API_DB_NAME": cfg.get("SUB2API_DB_NAME", DEFAULTS["SUB2API_DB_NAME"]),
+            "SUB2API_DB_USER": cfg.get("SUB2API_DB_USER", DEFAULTS["SUB2API_DB_USER"]),
+            "SUB2API_DB_PASSWORD": cfg.get("SUB2API_DB_PASSWORD", DEFAULTS["SUB2API_DB_PASSWORD"]),
             "SUB2API_GROK_GROUP_ID": cfg.get("SUB2API_GROK_GROUP_ID", DEFAULTS["SUB2API_GROK_GROUP_ID"]),
             "SUB2API_GROK_GROUP_NAME": cfg.get("SUB2API_GROK_GROUP_NAME", DEFAULTS["SUB2API_GROK_GROUP_NAME"]),
             "UPSTREAM_URL": cfg.get("SUB2API_URL", cfg.get("UPSTREAM_URL", DEFAULTS["SUB2API_URL"])),
@@ -1984,6 +1710,7 @@ def get_config():
         "masked": {
             "FREEMAIL_TOKEN": mask_secret(cfg.get("FREEMAIL_TOKEN", "")),
             "YESCAPTCHA_KEY": mask_secret(cfg.get("YESCAPTCHA_KEY", "")),
+            "SUB2API_DB_PASSWORD": mask_secret(cfg.get("SUB2API_DB_PASSWORD", DEFAULTS["SUB2API_DB_PASSWORD"])),
             "UPSTREAM_ADMIN_PASSWORD": mask_secret(cfg.get("UPSTREAM_ADMIN_PASSWORD", "")),
         },
     })
@@ -2038,8 +1765,27 @@ def save_config():
     ui_host = str(body.get("UI_HOST", current.get("UI_HOST", DEFAULTS["UI_HOST"]))).strip() or "127.0.0.1"
     ui_port = str(body.get("UI_PORT", current.get("UI_PORT", DEFAULTS["UI_PORT"]))).strip() or "3333"
     sub2api_url = str(body.get("SUB2API_URL", body.get("UPSTREAM_URL", current.get("SUB2API_URL", current.get("UPSTREAM_URL", DEFAULTS["SUB2API_URL"]))))).strip()
-    sub2api_group_id = str(body.get("SUB2API_GROK_GROUP_ID", current.get("SUB2API_GROK_GROUP_ID", DEFAULTS["SUB2API_GROK_GROUP_ID"]))).strip() or DEFAULTS["SUB2API_GROK_GROUP_ID"]
-    sub2api_group_name = str(body.get("SUB2API_GROK_GROUP_NAME", current.get("SUB2API_GROK_GROUP_NAME", DEFAULTS["SUB2API_GROK_GROUP_NAME"]))).strip() or DEFAULTS["SUB2API_GROK_GROUP_NAME"]
+    sub2api_container = str(body.get("SUB2API_DOCKER_CONTAINER", current.get("SUB2API_DOCKER_CONTAINER", DEFAULTS["SUB2API_DOCKER_CONTAINER"]))).strip() or DEFAULTS["SUB2API_DOCKER_CONTAINER"]
+    sub2api_db_host = str(body.get("SUB2API_DB_HOST", current.get("SUB2API_DB_HOST", DEFAULTS["SUB2API_DB_HOST"]))).strip() or DEFAULTS["SUB2API_DB_HOST"]
+    sub2api_db_port = str(body.get("SUB2API_DB_PORT", current.get("SUB2API_DB_PORT", DEFAULTS["SUB2API_DB_PORT"]))).strip() or DEFAULTS["SUB2API_DB_PORT"]
+    sub2api_db_name = str(body.get("SUB2API_DB_NAME", current.get("SUB2API_DB_NAME", DEFAULTS["SUB2API_DB_NAME"]))).strip() or DEFAULTS["SUB2API_DB_NAME"]
+    sub2api_db_user = str(body.get("SUB2API_DB_USER", current.get("SUB2API_DB_USER", DEFAULTS["SUB2API_DB_USER"]))).strip() or DEFAULTS["SUB2API_DB_USER"]
+    sub2api_db_password = str(body.get("SUB2API_DB_PASSWORD", current.get("SUB2API_DB_PASSWORD", DEFAULTS["SUB2API_DB_PASSWORD"]))).strip() or DEFAULTS["SUB2API_DB_PASSWORD"]
+    # 页面只维护分组名称；ID 由连通测试/导入时自动拉取并回写
+    sub2api_group_name = str(
+        body.get(
+            "SUB2API_GROK_GROUP_NAME",
+            current.get("SUB2API_GROK_GROUP_NAME", DEFAULTS["SUB2API_GROK_GROUP_NAME"]),
+        )
+    ).strip() or DEFAULTS["SUB2API_GROK_GROUP_NAME"]
+    # 兼容旧前端仍传 ID：有则暂存，最终以名称解析结果为准
+    sub2api_group_id = str(
+        body.get(
+            "SUB2API_GROK_GROUP_ID",
+            current.get("SUB2API_GROK_GROUP_ID", DEFAULTS["SUB2API_GROK_GROUP_ID"]),
+        )
+        or ""
+    ).strip()
     upstream_url = sub2api_url
     upstream_email = str(body.get("UPSTREAM_ADMIN_EMAIL", current.get("UPSTREAM_ADMIN_EMAIL", ""))).strip()
     upstream_pwd = str(body.get("UPSTREAM_ADMIN_PASSWORD", current.get("UPSTREAM_ADMIN_PASSWORD", ""))).strip()
@@ -2073,8 +1819,13 @@ def save_config():
         return jsonify({"ok": False, "message": "SOLVER_PORT 必须是 2-5 位数字"}), 400
     if not re.fullmatch(r"\d{1,2}", solver_threads) or not (1 <= int(solver_threads) <= 16):
         return jsonify({"ok": False, "message": "SOLVER_THREADS 范围 1-16"}), 400
+    if not re.fullmatch(r"\d{2,5}", sub2api_db_port):
+        return jsonify({"ok": False, "message": "SUB2API_DB_PORT 必须是 2-5 位数字"}), 400
+    if not sub2api_group_name:
+        return jsonify({"ok": False, "message": "请填写分组名称"}), 400
+    # 旧缓存 ID 可保留；非法则清空，等名称解析后回写
     if sub2api_group_id and not re.fullmatch(r"\d+", sub2api_group_id):
-        return jsonify({"ok": False, "message": "SUB2API_GROK_GROUP_ID 必须是数字"}), 400
+        sub2api_group_id = ""
     if solver_browser not in ("camoufox", "chromium", "chrome", "msedge"):
         return jsonify({"ok": False, "message": "SOLVER_BROWSER 不支持该值"}), 400
     if not solver:
@@ -2095,6 +1846,12 @@ def save_config():
         "UI_HOST": ui_host,
         "UI_PORT": ui_port,
         "SUB2API_URL": sub2api_url,
+        "SUB2API_DOCKER_CONTAINER": sub2api_container,
+        "SUB2API_DB_HOST": sub2api_db_host,
+        "SUB2API_DB_PORT": sub2api_db_port,
+        "SUB2API_DB_NAME": sub2api_db_name,
+        "SUB2API_DB_USER": sub2api_db_user,
+        "SUB2API_DB_PASSWORD": sub2api_db_password,
         "SUB2API_GROK_GROUP_ID": sub2api_group_id,
         "SUB2API_GROK_GROUP_NAME": sub2api_group_name,
         "UPSTREAM_URL": upstream_url,
@@ -2106,24 +1863,47 @@ def save_config():
         apply_env_to_process(values)
         logs.emit(f"配置已保存到 .env（邮箱域名: {mail_domain}）", "success")
 
-        # 保存后自动测试 sub2api HTTP 写入通道
+        # 保存后自动测试 sub2api HTTP 通道，并按名称解析 group_id 回写
         upstream_test = None
-        if sub2api_url and upstream_email and upstream_pwd and sub2api_group_id:
+        if sub2api_url and upstream_email and upstream_pwd and sub2api_group_name:
             try:
                 upstream_test = test_upstream_connectivity(
                     sub2api_url,
                     password=upstream_pwd,
                     email=upstream_email,
+                    group_name=sub2api_group_name,
+                    group_id=sub2api_group_id or None,
                 )
                 level = "success" if upstream_test.get("ok") else "warn"
                 logs.emit(f"sub2api 连通性: {upstream_test.get('message')}", level)
+                if upstream_test.get("ok") and isinstance(upstream_test.get("group"), dict):
+                    g = upstream_test["group"]
+                    if g.get("group_id") is not None:
+                        sub2api_group_id = str(g.get("group_id"))
+                        values["SUB2API_GROK_GROUP_ID"] = sub2api_group_id
+                    if g.get("group_name"):
+                        sub2api_group_name = str(g.get("group_name"))
+                        values["SUB2API_GROK_GROUP_NAME"] = sub2api_group_name
+                    # 再写一次，保证返回/侧栏立刻是解析后的 ID
+                    try:
+                        write_env_file(values)
+                        apply_env_to_process({
+                            "SUB2API_GROK_GROUP_ID": values.get("SUB2API_GROK_GROUP_ID", ""),
+                            "SUB2API_GROK_GROUP_NAME": values.get("SUB2API_GROK_GROUP_NAME", ""),
+                        })
+                    except Exception:
+                        pass
             except Exception as te:
                 upstream_test = {"ok": False, "message": str(te)}
                 logs.emit(f"sub2api 连通性测试异常: {te}", "warn")
 
         msg = "配置已保存"
         if upstream_test is not None:
-            msg += "；" + ("sub2api 连通正常" if upstream_test.get("ok") else f"sub2api 连通失败: {upstream_test.get('message')}")
+            if upstream_test.get("ok"):
+                g = upstream_test.get("group") or {}
+                msg += f"；sub2api 连通正常，分组 {g.get('group_name') or sub2api_group_name} → id={g.get('group_id') or sub2api_group_id or '?'}"
+            else:
+                msg += f"；sub2api 连通失败: {upstream_test.get('message')}"
 
         return jsonify({
             "ok": True,
@@ -2198,6 +1978,7 @@ def start():
     body = request.get_json(silent=True) or {}
     workers = body.get("workers", 8)
     target = body.get("target", 100)
+    mode_raw = body.get("mode") or body.get("register_mode") or ""
     try:
         workers = int(workers)
         target = int(target)
@@ -2208,6 +1989,14 @@ def start():
         return jsonify({"ok": False, "message": "并发数范围 1-64"}), 400
     if target < 1 or target > 100000:
         return jsonify({"ok": False, "message": "注册数量范围 1-100000"}), 400
+
+    # 注册路径：same_session（默认 CLEAN）/ protocol（旧混合）
+    try:
+        from grok import resolve_register_mode
+
+        reg_mode = resolve_register_mode(mode_raw or None)
+    except Exception:
+        reg_mode = (mode_raw or "same_session").strip().lower() or "same_session"
 
     env = env_snapshot()
     if not env["worker_domain_set"] or not env["freemail_token_set"]:
@@ -2227,7 +2016,14 @@ def start():
         except ValueError:
             solver_threads = 2
         solver_threads = max(1, min(solver_threads, 16))
-        if workers > solver_threads * 2:
+        # same_session 还要跑 Camoufox 注册浏览器，并发更要克制
+        if reg_mode == "same_session" and workers > max(2, solver_threads):
+            logs.emit(
+                f"提示：same_session 路径并发 {workers}，建议 ≤ {max(2, min(4, solver_threads))} "
+                f"（注册浏览器 + Solver 双开）",
+                "warn",
+            )
+        elif workers > solver_threads * 2:
             logs.emit(
                 f"提示：并发 {workers} 远大于 Solver 浏览器数 {solver_threads}，"
                 f"建议并发 ≤ {solver_threads * 2}，或在配置里提高 SOLVER_THREADS 后重启 Solver",
@@ -2272,7 +2068,8 @@ def start():
         except Exception as e:
             logs.emit(f"Solver 看门狗启动失败（任务仍继续）: {e}", "warn")
 
-    result = engine.start(workers=workers, target=target, blocking=False)
+    logs.emit(f"注册路径: {reg_mode}", "info")
+    result = engine.start(workers=workers, target=target, blocking=False, mode=reg_mode)
     if not result.get("ok") and use_local_solver:
         try:
             solver_manager.stop_watchdog()
@@ -2331,89 +2128,33 @@ def list_keys():
 
 @app.post("/api/upstream/test")
 def upstream_test():
-    """测试 sub2api HTTP Admin API（可用临时参数覆盖已保存配置）。"""
+    """测试 sub2api HTTP 登录与 Grok 分组（可用临时参数覆盖已保存配置）。"""
     body = request.get_json(silent=True) or {}
     base = body.get("SUB2API_URL") or body.get("UPSTREAM_URL") or body.get("url")
-    email = body.get("UPSTREAM_ADMIN_EMAIL") or body.get("email")
+    admin_email = body.get("UPSTREAM_ADMIN_EMAIL") or body.get("email")
     pwd = body.get("UPSTREAM_ADMIN_PASSWORD") or body.get("password")
+    group_id = body.get("SUB2API_GROK_GROUP_ID") or body.get("group_id")
+    group_name = body.get("SUB2API_GROK_GROUP_NAME") or body.get("group_name")
     # 空字符串表示“用已保存值”
     if base is not None and str(base).strip() == "":
         base = None
+    if admin_email is not None and str(admin_email).strip() == "":
+        admin_email = None
     if pwd is not None and str(pwd).strip() == "":
         pwd = None
-    if email is not None and str(email).strip() == "":
-        email = None
-    cfg = get_sub2api_config()
-    if "SUB2API_GROK_GROUP_ID" in body:
-        cfg["group_id"] = str(body.get("SUB2API_GROK_GROUP_ID") or "").strip()
-    if "SUB2API_GROK_GROUP_NAME" in body:
-        cfg["group_name"] = str(body.get("SUB2API_GROK_GROUP_NAME") or "").strip()
+    if group_id is not None and str(group_id).strip() == "":
+        group_id = None
+    if group_name is not None and str(group_name).strip() == "":
+        group_name = None
     result = test_upstream_connectivity(
         base_url=str(base).strip() if base is not None else None,
         password=str(pwd) if pwd is not None else None,
-        email=str(email).strip() if email is not None else None,
-        cfg=cfg,
+        email=str(admin_email).strip() if admin_email is not None else None,
+        group_id=str(group_id).strip() if group_id is not None else None,
+        group_name=str(group_name).strip() if group_name is not None else None,
     )
     code = 200 if result.get("ok") else 502
     return jsonify(result), code
-
-
-@app.post("/api/upstream/groups")
-def upstream_groups():
-    """读取当前管理员可见的 Grok 分组，用于配置下拉选择。"""
-    body = request.get_json(silent=True) or {}
-    cfg = get_sub2api_config()
-    base = body.get("SUB2API_URL") or body.get("UPSTREAM_URL") or body.get("url")
-    email = body.get("UPSTREAM_ADMIN_EMAIL") or body.get("email")
-    password = body.get("UPSTREAM_ADMIN_PASSWORD") or body.get("password")
-    if base is not None and not str(base).strip():
-        base = None
-    if email is not None and not str(email).strip():
-        email = None
-    if password is not None and not str(password).strip():
-        password = None
-
-    login = sub2api_http_login(
-        base_url=str(base).strip() if base is not None else None,
-        email=str(email).strip() if email is not None else None,
-        password=str(password) if password is not None else None,
-        cfg=cfg,
-    )
-    if not login.get("ok"):
-        return jsonify({"ok": False, "message": login.get("error") or "sub2api 管理员登录失败", "groups": []}), 502
-
-    response = sub2api_http_request(
-        "GET",
-        "/api/v1/admin/groups",
-        token=login["access_token"],
-        base_url=login["base_url"],
-        params={"platform": "grok", "page": 1, "page_size": 50},
-        timeout=15,
-    )
-    data = response.get("data") if isinstance(response.get("data"), dict) else {}
-    items = data.get("items") if isinstance(data.get("items"), list) else []
-    if not response.get("ok"):
-        return jsonify({"ok": False, "message": response.get("error") or "读取 Grok 分组失败", "groups": []}), 502
-
-    groups = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        try:
-            group_id = int(item.get("id"))
-        except (TypeError, ValueError):
-            continue
-        name = str(item.get("name") or "").strip()
-        if not name:
-            continue
-        groups.append({"id": group_id, "name": name, "status": item.get("status") or ""})
-    groups.sort(key=lambda item: (item["name"].lower(), item["id"]))
-    return jsonify({
-        "ok": True,
-        "message": f"已读取 {len(groups)} 个 Grok 分组",
-        "groups": groups,
-        "base_url": login["base_url"],
-    })
 
 
 def _safe_keys_file(name: str) -> Path | None:
@@ -2476,60 +2217,22 @@ def _mark_recent_imported(selected: list[dict] | None, result: dict) -> None:
             it["auth_token"] = None
 
 
-def _update_import_job(**kwargs) -> None:
-    with _import_job_lock:
-        for k, v in kwargs.items():
-            if k in _import_job or k in (
-                "id",
-                "running",
-                "status",
-                "message",
-                "source",
-                "total",
-                "done",
-                "success",
-                "fail",
-                "current",
-                "started_at",
-                "finished_at",
-                "result",
-            ):
-                _import_job[k] = v
-
-
-def _import_progress_cb(**kwargs) -> None:
-    patch = {}
-    if kwargs.get("done") is not None:
-        patch["done"] = int(kwargs["done"] or 0)
-    if kwargs.get("total") is not None:
-        patch["total"] = int(kwargs["total"] or 0)
-    if kwargs.get("success") is not None:
-        patch["success"] = int(kwargs["success"] or 0)
-    if kwargs.get("fail") is not None:
-        patch["fail"] = int(kwargs["fail"] or 0)
-    if kwargs.get("current") is not None:
-        patch["current"] = str(kwargs.get("current") or "")
-    phase = kwargs.get("phase") or ""
-    if phase:
-        cur = patch.get("current") or _import_job.get("current") or ""
-        if phase == "retry_cooldown":
-            patch["message"] = cur or "冷却后重试…"
-        elif phase == "retry":
-            patch["message"] = f"抢救中：{cur}" if cur else "抢救中…"
-        else:
-            total = patch.get("total", _import_job.get("total") or 0)
-            done = patch.get("done", _import_job.get("done") or 0)
-            patch["message"] = f"导入中 {done}/{total}" + (f" · {cur}" if cur else "")
-    if patch:
-        _update_import_job(**patch)
-
-
-def _prepare_import_payload(body: dict) -> dict:
-    """解析请求体，返回 accounts/sso_lines/selected/source 等，失败返回 {error, code}。"""
+@app.post("/api/upstream/import")
+def upstream_import():
+    """将最近成功的 SSO / keys 文件导入 sub2api grok 分组。"""
+    body = request.get_json(silent=True) or {}
     merge = body.get("merge", True)
+    # 本机 device flow 后写 token：固定串行，忽略客户端并发参数
+    try:
+        max_workers = int(body.get("max_workers", 1))
+    except (TypeError, ValueError):
+        max_workers = 1
+    max_workers = 1
+
+    # 支持：keys 文件 / 指定 id / 指定 sso 原文 / 当前 output_file / 全部未导入
     ids = body.get("ids")
     if ids is not None and not isinstance(ids, list):
-        return {"error": "ids 必须是数组", "code": 400}
+        return jsonify({"ok": False, "message": "ids 必须是数组"}), 400
 
     raw_ssos = body.get("sso_cookies") or body.get("ssos")
     only_pending = bool(body.get("only_pending", True))
@@ -2539,35 +2242,37 @@ def _prepare_import_payload(body: dict) -> dict:
 
     items = list(engine.recent_success)
     selected: list[dict] = []
-    source = "recent_success"
-    accounts: list[dict] = []
     sso_lines: list[str] = []
-    file_label = ""
+    source = "recent_success"
 
     if raw_ssos and isinstance(raw_ssos, list) and raw_ssos:
+        # 直接导入调用方提供的 SSO 行（无注册缓存 token，走 device flow）
         for line in raw_ssos:
             s = str(line or "").strip()
             if s:
                 sso_lines.append(s)
         if not sso_lines:
-            return {"error": "sso_cookies 为空", "code": 400}
-        return {
-            "merge": merge,
-            "source": "sso_cookies",
-            "sso_lines": sso_lines,
-            "accounts": None,
-            "selected": None,
-            "submitted": len(sso_lines),
-            "file": "",
-        }
+            return jsonify({"ok": False, "message": "sso_cookies 为空"}), 400
+        source = "sso_cookies"
+        result = import_sso_to_upstream(
+            sso_lines=sso_lines, merge=merge, max_workers=max_workers
+        )
+        _mark_recent_imported(None, result)
+        level = "success" if result.get("ok") else ("warn" if (result.get("success") or 0) > 0 else "error")
+        logs.emit(f"sub2api 导入: {result.get('message')}（提交 {len(sso_lines)} 条 · {source}）", level)
+        code = 200 if result.get("ok") or (result.get("success") or 0) > 0 else 502
+        result["submitted"] = len(sso_lines)
+        result["source"] = source
+        result["recent_success"] = engine.get_status().get("recent_success", [])
+        return jsonify(result), code
 
+    # 从 keys 文件或当前任务 output_file 全量导入（不受 recent_success 截断影响）
     file_path: Path | None = None
     if file_name:
         file_path = _safe_keys_file(str(file_name))
         if not file_path:
-            return {"error": f"无效或不存在的 keys 文件: {file_name}", "code": 400}
+            return jsonify({"ok": False, "message": f"无效或不存在的 keys 文件: {file_name}"}), 400
         source = f"file:{file_path.name}"
-        file_label = file_path.name
     elif use_output_file and engine.output_file:
         candidate = Path(engine.output_file)
         if not candidate.is_absolute():
@@ -2575,17 +2280,18 @@ def _prepare_import_payload(body: dict) -> dict:
         if candidate.is_file():
             file_path = candidate
             source = f"output:{candidate.name}"
-            file_label = candidate.name
 
     if file_path is not None:
         sso_lines = _read_sso_file_lines(file_path)
         if not sso_lines:
-            return {"error": f"文件无有效 SSO: {file_path.name}", "code": 400}
+            return jsonify({"ok": False, "message": f"文件无有效 SSO: {file_path.name}"}), 400
+        # 有缓存 token 的项尽量带上（同 sso 匹配），加速导入
         token_by_sso = {
             (it.get("sso") or "").strip(): it.get("auth_token")
             for it in items
             if it.get("sso") and isinstance(it.get("auth_token"), dict)
         }
+        accounts = []
         for email, sso in _parse_sso_import_lines(sso_lines):
             sso = (sso or "").strip()
             if not sso:
@@ -2597,15 +2303,21 @@ def _prepare_import_payload(body: dict) -> dict:
                     "auth_token": token_by_sso.get(sso),
                 }
             )
-        return {
-            "merge": merge,
-            "source": source,
-            "sso_lines": None,
-            "accounts": accounts,
-            "selected": None,
-            "submitted": len(accounts),
-            "file": file_label,
-        }
+        result = import_sso_to_upstream(
+            accounts=accounts, merge=merge, max_workers=max_workers
+        )
+        _mark_recent_imported(None, result)
+        level = "success" if result.get("ok") else ("warn" if (result.get("success") or 0) > 0 else "error")
+        logs.emit(
+            f"sub2api 导入: {result.get('message')}（提交 {len(accounts)} 条 · {source}）",
+            level,
+        )
+        code = 200 if result.get("ok") or (result.get("success") or 0) > 0 else 502
+        result["submitted"] = len(accounts)
+        result["source"] = source
+        result["file"] = file_path.name
+        result["recent_success"] = engine.get_status().get("recent_success", [])
+        return jsonify(result), code
 
     if ids:
         id_set = {str(x) for x in ids}
@@ -2613,6 +2325,7 @@ def _prepare_import_payload(body: dict) -> dict:
             if str(it.get("id") or "") in id_set and it.get("sso"):
                 selected.append(it)
     elif import_all:
+        # 优先：内存未导入项；若为空且有 output_file，回退读文件（防重启/截断丢号）
         for it in items:
             if not it.get("sso"):
                 continue
@@ -2626,289 +2339,69 @@ def _prepare_import_payload(body: dict) -> dict:
             if candidate.is_file():
                 sso_lines = _read_sso_file_lines(candidate)
                 if sso_lines:
-                    return {
-                        "merge": merge,
-                        "source": f"output:{candidate.name}",
-                        "sso_lines": sso_lines,
-                        "accounts": None,
-                        "selected": None,
-                        "submitted": len(sso_lines),
-                        "file": candidate.name,
-                    }
+                    source = f"output:{candidate.name}"
+                    result = import_sso_to_upstream(
+                        sso_lines=sso_lines, merge=merge, max_workers=max_workers
+                    )
+                    _mark_recent_imported(None, result)
+                    level = (
+                        "success"
+                        if result.get("ok")
+                        else ("warn" if (result.get("success") or 0) > 0 else "error")
+                    )
+                    logs.emit(
+                        f"sub2api 导入: {result.get('message')}（提交 {len(sso_lines)} 条 · {source}）",
+                        level,
+                    )
+                    code = 200 if result.get("ok") or (result.get("success") or 0) > 0 else 502
+                    result["submitted"] = len(sso_lines)
+                    result["source"] = source
+                    result["file"] = candidate.name
+                    result["recent_success"] = engine.get_status().get("recent_success", [])
+                    return jsonify(result), code
     else:
+        # 默认：全部未导入
         for it in items:
             if it.get("sso") and not it.get("imported"):
                 selected.append(it)
 
     if not selected:
-        return {
-            "error": "没有可导入的成功账号（请先注册，或选择 keys 文件导入）",
-            "code": 400,
-        }
+        return jsonify({
+            "ok": False,
+            "message": "没有可导入的成功账号（请先注册，或选择 keys 文件导入）",
+        }), 400
 
+    # 去重 SSO，并带上注册时缓存的 auth_token（有则导入秒级直写）
     seen = set()
+    accounts = []
     for it in selected:
         sso = (it.get("sso") or "").strip()
         if not sso or sso in seen:
             continue
         seen.add(sso)
+        email = (it.get("email") or "").strip()
+        token = it.get("auth_token")
         accounts.append(
             {
-                "email": (it.get("email") or "").strip(),
+                "email": email,
                 "sso": sso,
-                "auth_token": it.get("auth_token")
-                if isinstance(it.get("auth_token"), dict)
-                else None,
+                "auth_token": token if isinstance(token, dict) else None,
             }
         )
-    return {
-        "merge": merge,
-        "source": source,
-        "sso_lines": None,
-        "accounts": accounts,
-        "selected": selected,
-        "submitted": len(accounts),
-        "file": "",
-    }
 
-
-def _retry_accounts_from_result(payload: dict, result: dict) -> list[dict]:
-    """按导入结果索引保留可重试 SSO；仅保存在服务端任务内存。"""
-    normalized = _normalize_import_accounts(
-        sso_lines=payload.get("sso_lines"),
-        accounts=payload.get("accounts"),
+    result = import_sso_to_upstream(
+        accounts=accounts, merge=merge, max_workers=max_workers
     )
-    retry_accounts: list[dict] = []
-    for row in result.get("results") or []:
-        if not isinstance(row, dict) or row.get("status") != "failed" or not row.get("retryable"):
-            continue
-        try:
-            index = int(row.get("index") or 0)
-        except (TypeError, ValueError):
-            continue
-        if 1 <= index <= len(normalized):
-            retry_accounts.append(dict(normalized[index - 1]))
-    return retry_accounts
+    _mark_recent_imported(selected, result)
 
-
-def _run_import_job(job_id: str, payload: dict) -> None:
-    def progress_cb(**kwargs):
-        # 任务被替换时不再更新
-        with _import_job_lock:
-            if _import_job.get("id") != job_id:
-                return
-        _import_progress_cb(**kwargs)
-
-    try:
-        result = import_sso_to_upstream(
-            sso_lines=payload.get("sso_lines"),
-            accounts=payload.get("accounts"),
-            merge=bool(payload.get("merge", True)),
-            max_workers=1,
-            progress_cb=progress_cb,
-        )
-        _mark_recent_imported(payload.get("selected"), result)
-        result["submitted"] = payload.get("submitted") or result.get("total") or 0
-        result["source"] = payload.get("source") or ""
-        if payload.get("file"):
-            result["file"] = payload["file"]
-        retry_accounts = _retry_accounts_from_result(payload, result)
-
-        ok = bool(result.get("ok") or (result.get("success") or 0) > 0)
-        level = "success" if result.get("ok") else (
-            "warn" if (result.get("success") or 0) > 0 else "error"
-        )
-        logs.emit(
-            f"sub2api 导入: {result.get('message')}（提交 {result.get('submitted')} 条 · {result.get('source')}）",
-            level,
-        )
-        with _import_job_lock:
-            if _import_job.get("id") != job_id:
-                return
-            _import_job.update(
-                {
-                    "running": False,
-                    "status": "done" if ok else "error",
-                    "message": result.get("message") or "导入结束",
-                    "done": int(result.get("total") or _import_job.get("done") or 0),
-                    "total": int(result.get("total") or _import_job.get("total") or 0),
-                    "success": int(result.get("success") or 0),
-                    "fail": int(result.get("fail") or 0),
-                    "current": "",
-                    "finished_at": time.time(),
-                    "result": result,
-                    "retry_accounts": retry_accounts,
-                }
-            )
-    except Exception as e:
-        logs.emit(f"sub2api 导入任务异常: {e}", "error")
-        with _import_job_lock:
-            if _import_job.get("id") != job_id:
-                return
-            _import_job.update(
-                {
-                    "running": False,
-                    "status": "error",
-                    "message": f"导入异常: {e}",
-                    "finished_at": time.time(),
-                    "result": {"ok": False, "message": str(e), "success": 0, "fail": 0},
-                    "retry_accounts": [],
-                }
-            )
-
-
-@app.post("/api/upstream/import")
-def upstream_import():
-    """将最近成功的 SSO / keys 文件导入 sub2api grok 分组（前台同步，等全部完成再返回）。"""
-    body = request.get_json(silent=True) or {}
-    # 默认前台同步；仅显式 async=true 时走后台（一般不用）
-    async_mode = body.get("async", False)
-    if isinstance(async_mode, str):
-        async_mode = async_mode.strip().lower() in ("1", "true", "yes")
-
-    with _import_job_lock:
-        already_running = bool(_import_job.get("running"))
-    if already_running:
-        return jsonify(
-            {
-                "ok": False,
-                "message": "已有导入任务在进行中",
-                "job": get_import_job_public(),
-            }
-        ), 409
-
-    prepared = _prepare_import_payload(body)
-    if prepared.get("error"):
-        return jsonify({"ok": False, "message": prepared["error"]}), int(
-            prepared.get("code") or 400
-        )
-
-    submitted = int(prepared.get("submitted") or 0)
-    source = prepared.get("source") or ""
-
-    # 前台同步路径（默认）
-    if not async_mode:
-        result = import_sso_to_upstream(
-            sso_lines=prepared.get("sso_lines"),
-            accounts=prepared.get("accounts"),
-            merge=bool(prepared.get("merge", True)),
-            max_workers=1,
-        )
-        _mark_recent_imported(prepared.get("selected"), result)
-        result["submitted"] = submitted
-        result["source"] = source
-        if prepared.get("file"):
-            result["file"] = prepared["file"]
-        level = "success" if result.get("ok") else (
-            "warn" if (result.get("success") or 0) > 0 else "error"
-        )
-        logs.emit(
-            f"sub2api 导入: {result.get('message')}（提交 {submitted} 条 · {source}）",
-            level,
-        )
-        code = 200 if result.get("ok") or (result.get("success") or 0) > 0 else 502
-        result["recent_success"] = engine.get_status().get("recent_success", [])
-        return jsonify(result), code
-
-    # 可选后台路径（仅 async=true）
-    job_id = uuid.uuid4().hex[:12]
-    _update_import_job(
-        id=job_id,
-        running=True,
-        status="running",
-        message=f"已开始导入 {submitted} 条（{source}）",
-        source=source,
-        total=submitted,
-        done=0,
-        success=0,
-        fail=0,
-        current="",
-        started_at=time.time(),
-        finished_at=None,
-        result=None,
-        retry_accounts=[],
-    )
-    logs.emit(f"sub2api 导入任务已启动：{submitted} 条 · {source}（后台运行）", "info")
-    t = threading.Thread(
-        target=_run_import_job,
-        args=(job_id, prepared),
-        daemon=True,
-        name=f"ImportJob-{job_id}",
-    )
-    t.start()
-    return jsonify(
-        {
-            "ok": True,
-            "async": True,
-            "message": f"导入已在后台开始（{submitted} 条）",
-            "job_id": job_id,
-            "submitted": submitted,
-            "source": source,
-            "job": get_import_job_public(),
-        }
-    )
-
-
-@app.post("/api/upstream/import/retry")
-def upstream_import_retry():
-    """重新提交上一任务中标记为可重试的失败 SSO。"""
-    with _import_job_lock:
-        already_running = bool(_import_job.get("running"))
-        retry_accounts = _import_job.get("retry_accounts")
-        previous_source = str(_import_job.get("source") or "previous_import")
-    if already_running:
-        return jsonify({"ok": False, "message": "已有导入任务在进行中", "job": get_import_job_public()}), 409
-    if not isinstance(retry_accounts, list) or not retry_accounts:
-        return jsonify({"ok": False, "message": "没有可重试的失败项"}), 400
-
-    accounts = [dict(item) for item in retry_accounts if isinstance(item, dict) and item.get("sso")]
-    if not accounts:
-        return jsonify({"ok": False, "message": "没有可重试的有效 SSO"}), 400
-
-    job_id = uuid.uuid4().hex[:12]
-    source = f"retry:{previous_source}"
-    payload = {
-        "merge": True,
-        "source": source,
-        "sso_lines": None,
-        "accounts": accounts,
-        "selected": None,
-        "submitted": len(accounts),
-        "file": "",
-    }
-    _update_import_job(
-        id=job_id,
-        running=True,
-        status="running",
-        message=f"已开始重试 {len(accounts)} 条（{source}）",
-        source=source,
-        total=len(accounts),
-        done=0,
-        success=0,
-        fail=0,
-        current="",
-        started_at=time.time(),
-        finished_at=None,
-        result=None,
-        retry_accounts=[],
-    )
-    logs.emit(f"sub2api 重试任务已启动：{len(accounts)} 条 · {source}", "info")
-    t = threading.Thread(
-        target=_run_import_job,
-        args=(job_id, payload),
-        daemon=True,
-        name=f"ImportRetry-{job_id}",
-    )
-    t.start()
-    return jsonify({
-        "ok": True,
-        "async": True,
-        "message": f"失败项已在后台重试（{len(accounts)} 条）",
-        "job_id": job_id,
-        "submitted": len(accounts),
-        "source": source,
-        "job": get_import_job_public(),
-    })
+    level = "success" if result.get("ok") else ("warn" if (result.get("success") or 0) > 0 else "error")
+    logs.emit(f"sub2api 导入: {result.get('message')}（提交 {len(accounts)} 条 · {source}）", level)
+    code = 200 if result.get("ok") or (result.get("success") or 0) > 0 else 502
+    result["submitted"] = len(accounts)
+    result["source"] = source
+    # 与 /api/status 一致：不回传完整 sso
+    result["recent_success"] = engine.get_status().get("recent_success", [])
+    return jsonify(result), code
 
 
 @app.get("/keys/<path:filename>")
