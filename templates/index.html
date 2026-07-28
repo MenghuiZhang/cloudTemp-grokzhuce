@@ -206,34 +206,87 @@
       50% { opacity: .5; transform: scale(.85); }
     }
     .pulse-live { animation: pulse-dot 1.4s ease-in-out infinite; }
-    #logBox, #successList, #keysList { scrollbar-width: thin; scrollbar-color: #d5cdb8 transparent; }
+    #logBox, #postLogBox, #successList, #keysList { scrollbar-width: thin; scrollbar-color: #d5cdb8 transparent; }
+    /* 日志双栏：不靠 Tailwind xl 断点（很多窗口 <1280 时 col-span 不生效，宽死活不变） */
+    .log-split {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 0.75rem;
+      min-width: 0;
+    }
+    @media (min-width: 1024px) {
+      /* 主流程 : 右侧 ≈ 1.85 : 1（主区明显更宽） */
+      .log-split {
+        grid-template-columns: minmax(0, 1.85fr) minmax(0, 1fr);
+      }
+    }
+    #logBox, #postLogBox { width: 100%; min-width: 0; }
+    /* 配置页：平铺分组，面板内滚动 */
+    #tab-config {
+      max-height: min(72vh, 42rem);
+      overflow-y: auto;
+      scrollbar-width: thin;
+      scrollbar-color: #d5cdb8 transparent;
+    }
+    #tab-config .cfg-block {
+      border: 1px solid rgba(26, 23, 18, 0.08);
+      border-radius: 0.9rem;
+      background: #fff;
+      padding: 0.85rem 0.95rem 0.95rem;
+      display: grid;
+      gap: 0.65rem;
+    }
+    #tab-config .cfg-title {
+      font-size: 0.8125rem;
+      font-weight: 700;
+      color: #1a1712;
+      margin: 0;
+      padding-bottom: 0.15rem;
+      border-bottom: 1px solid rgba(26, 23, 18, 0.06);
+    }
+    #tab-config .field-label { margin-bottom: 0.2rem; }
+    #tab-config .field { padding: 0.55rem 0.7rem; }
+    #tab-config .hint {
+      margin-top: 0.2rem;
+      font-size: 10px;
+      line-height: 1.35;
+      color: rgba(63, 58, 51, 0.45);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .secret-wrap { position: relative; }
+    .secret-wrap .field { padding-right: 2.6rem; }
+    .secret-wrap .toggle-eye {
+      position: absolute;
+      right: 0.55rem;
+      top: 50%;
+      transform: translateY(-50%);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 1.75rem;
+      height: 1.75rem;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: #8a8376;
+      cursor: pointer;
+      border-radius: 0.4rem;
+    }
+    .secret-wrap .toggle-eye:hover { color: #1857ab; background: rgba(24, 87, 171, 0.06); }
+    .secret-wrap .toggle-eye svg { width: 1rem; height: 1rem; pointer-events: none; }
     .tab-btn.active {
       background: #fff;
       color: #1857ab;
       box-shadow: 0 1px 3px rgba(42,38,31,.08);
       font-weight: 700;
     }
-    .secret-wrap { position: relative; }
-    .secret-wrap .toggle-eye {
-      position: absolute;
-      right: 0.7rem;
-      top: 50%;
-      transform: translateY(-50%);
-      color: #8a8376;
-      font-size: 0.75rem;
-      font-weight: 600;
-      background: none;
-      border: 0;
-      cursor: pointer;
-    }
-    .secret-wrap .field { padding-right: 3.2rem; }
   </style>
 </head>
 <body class="h-full font-sans antialiased">
   <div class="min-h-full">
     <!-- Header -->
     <header class="sticky top-0 z-30 border-b border-ink-900/5 bg-paper-50/90 backdrop-blur-md">
-      <div class="max-w-7xl mx-auto px-4 sm:px-6 py-4 flex items-center justify-between gap-4">
+      <div class="max-w-[1680px] mx-auto px-4 sm:px-6 py-4 flex items-center justify-between gap-4">
         <div class="flex items-center gap-3">
           <div class="h-11 w-11 rounded-2xl bg-gradient-to-br from-brand-500 to-leaf-500 text-white grid place-items-center shadow-soft font-display text-lg font-bold">G</div>
           <div>
@@ -248,7 +301,7 @@
       </div>
     </header>
 
-    <main class="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-5">
+    <main class="max-w-[1680px] mx-auto px-4 sm:px-6 py-6 space-y-5">
       <!-- Stats -->
       <section class="grid grid-cols-2 lg:grid-cols-5 gap-3 sm:gap-4">
         <article class="panel rounded-2xl p-4">
@@ -290,19 +343,21 @@
         <div class="mt-3 flex flex-wrap gap-x-6 gap-y-1 text-xs font-mono text-ink-700/60">
           <span>路径：<span id="statMode" class="text-ink-800">同会话 CLEAN</span></span>
           <span>成功 <span id="statSuccessInline" class="text-leaf-600">0</span> / 目标 <span id="statTargetInline" class="text-ink-800">0</span></span>
+          <span>创邮 <span id="statAttemptInline" class="text-ink-800">0</span> / <span id="statAttemptTargetInline" class="text-ink-800">0</span></span>
           <span>CLEAN <span id="statCleanInline" class="text-leaf-600">0</span> · MARKED <span id="statMarked" class="text-sun-500">0</span></span>
           <span>输出：<span id="outputFile" class="text-ink-800">—</span></span>
           <span>Action：<span id="actionId" class="text-ink-800">—</span></span>
         </div>
         <div id="pipelineBox" class="mt-3 rounded-xl bg-paper-100 border border-ink-900/5 px-3 py-2.5 text-[11px] font-mono text-ink-700/70 leading-relaxed">
           <div class="text-[10px] uppercase tracking-[0.14em] text-ink-700/40 font-semibold mb-1">CLEAN 流水线</div>
-          <div id="pipelineSteps" class="text-ink-800">空闲 · 启动后显示：建邮 → camoufox → castle → 发码/验码 → turnstile → signup → SSO → risk → 换 token</div>
+          <div id="pipelineSteps" class="text-ink-800">空闲 · 启动后显示：建邮 → camoufox → castle → 发码/验码 → turnstile → signup → SSO → risk → 计成功 → 异步 risk/token/NSFW</div>
         </div>
       </section>
 
-      <div class="grid lg:grid-cols-12 gap-5">
+      <!-- 左控制 / 右日志：大屏日志区更宽，外层由 max-w-[1680px] 控宽而非 7xl -->
+      <div class="grid lg:grid-cols-12 gap-5 min-w-0">
         <!-- Left column -->
-        <section class="lg:col-span-5 space-y-4">
+        <section class="lg:col-span-4 space-y-4 min-w-0">
           <!-- Tabs: run / config -->
           <div class="panel rounded-2xl overflow-hidden">
             <div class="flex gap-1 p-1.5 bg-paper-100 border-b border-ink-900/5">
@@ -392,161 +447,161 @@
               </div>
             </div>
 
-            <!-- CONFIG PANEL -->
-            <div id="tab-config" class="p-5 space-y-4 hidden">
-              <div class="flex items-start justify-between gap-3">
+            <!-- CONFIG PANEL：平铺分组 + 内部滚动 -->
+            <div id="tab-config" class="p-4 space-y-3 hidden">
+              <div class="flex items-center justify-between gap-2">
                 <div>
-                  <h2 class="font-display font-semibold text-ink-900">环境配置</h2>
-                  <p class="text-xs text-ink-700/55 mt-1">保存后写入项目根目录 <code class="font-mono">.env</code></p>
+                  <h2 class="font-display font-semibold text-ink-900 text-sm">环境配置</h2>
+                  <p class="text-[10px] text-ink-700/45 font-mono">写入 .env</p>
                 </div>
-                <button type="button" id="btnReloadConfig" class="btn btn-ghost text-xs px-3 py-1.5">重新加载</button>
+                <div class="flex items-center gap-1.5">
+                  <button type="button" id="btnReloadConfig" class="btn btn-ghost text-[11px] px-2.5 py-1">重载</button>
+                  <button type="submit" form="configForm" id="btnSaveConfig" class="btn btn-primary text-[11px] px-3 py-1.5">保存</button>
+                </div>
               </div>
+              <p id="configMessage" class="text-[11px] font-mono min-h-[1rem] text-ink-700/50 -mt-1"></p>
 
-              <form id="configForm" class="space-y-3.5">
-                <div>
-                  <label class="field-label" for="cfgWorker">WORKER_DOMAIN <span class="text-rose-500">*</span></label>
-                  <input id="cfgWorker" class="field font-mono text-sm" placeholder="your-freemail-domain.com" autocomplete="off" />
-                  <p class="mt-1 text-[11px] text-ink-700/45">freemail 服务域名，不要带 https://</p>
-                </div>
-
-                <div>
-                  <label class="field-label" for="cfgToken">FREEMAIL_TOKEN <span class="text-rose-500">*</span></label>
-                  <div class="secret-wrap">
-                    <input id="cfgToken" type="password" class="field font-mono text-sm" placeholder="站点密码 / JWT" autocomplete="off" />
-                    <button type="button" class="toggle-eye" data-target="cfgToken">显示</button>
-                  </div>
-                </div>
-
-                <div>
-                  <div class="flex items-center justify-between gap-2 mb-1.5">
-                    <label class="field-label" style="margin-bottom:0" for="cfgMailDomain">FREEMAIL_DOMAIN</label>
-                    <button type="button" id="btnFetchDomains" class="btn btn-ghost text-[11px] px-2.5 py-1">拉取域名</button>
-                  </div>
-                  <div class="c-select" data-select="cfgMailDomain">
-                    <button type="button" class="c-select-btn" id="cfgMailDomainBtn">
-                      <span class="value">自动（服务端默认）</span>
-                      <svg class="chev" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.17l3.71-3.94a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clip-rule="evenodd"/></svg>
-                    </button>
-                    <div class="c-select-menu" role="listbox"></div>
-                    <input type="hidden" id="cfgMailDomain" value="auto" />
-                  </div>
-                  <p id="mailDomainHint" class="mt-1 text-[11px] text-ink-700/45">点击「拉取域名」从 freemail 自动获取可用后缀</p>
-                </div>
-
-                <div>
-                  <label class="field-label">验证码模式</label>
-                  <div class="c-select" data-select="captchaMode">
-                    <button type="button" class="c-select-btn" id="captchaModeBtn">
-                      <span class="value">本地 Turnstile Solver</span>
-                      <svg class="chev" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.17l3.71-3.94a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clip-rule="evenodd"/></svg>
-                    </button>
-                    <div class="c-select-menu" role="listbox"></div>
-                    <input type="hidden" id="captchaMode" value="local" />
-                  </div>
-                </div>
-
-                <div id="yesCaptchaBlock" class="hidden">
-                  <label class="field-label" for="cfgYes">YESCAPTCHA_KEY</label>
-                  <div class="secret-wrap">
-                    <input id="cfgYes" type="password" class="field font-mono text-sm" placeholder="YesCaptcha API Key" autocomplete="off" />
-                    <button type="button" class="toggle-eye" data-target="cfgYes">显示</button>
-                  </div>
-                </div>
-
-                <div>
-                  <label class="field-label" for="cfgSolver">SOLVER_URL</label>
-                  <input id="cfgSolver" class="field font-mono text-sm" placeholder="http://127.0.0.1:5072" />
-                </div>
-
-                <div class="grid grid-cols-2 gap-3">
+              <form id="configForm" class="space-y-2.5">
+                <!-- 1. 邮箱 -->
+                <div class="cfg-block">
+                  <h3 class="cfg-title">邮箱 freemail</h3>
                   <div>
-                    <label class="field-label">SOLVER_BROWSER</label>
-                    <div class="c-select" data-select="cfgSolverBrowser">
-                      <button type="button" class="c-select-btn" id="cfgSolverBrowserBtn">
-                        <span class="value">camoufox</span>
+                    <label class="field-label" for="cfgWorker">WORKER_DOMAIN <span class="text-rose-500">*</span></label>
+                    <input id="cfgWorker" class="field font-mono text-sm" placeholder="freemail 域名（无 https://）" autocomplete="off" />
+                  </div>
+                  <div>
+                    <label class="field-label" for="cfgToken">FREEMAIL_TOKEN <span class="text-rose-500">*</span></label>
+                    <div class="secret-wrap">
+                      <input id="cfgToken" type="password" class="field font-mono text-sm" placeholder="站点密码 / JWT" autocomplete="off" spellcheck="false" />
+                      <button type="button" class="toggle-eye" data-target="cfgToken" aria-label="显示/隐藏" title="显示/隐藏">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                      </button>
+                    </div>
+                  </div>
+                  <div>
+                    <div class="flex items-center justify-between gap-2 mb-1">
+                      <label class="field-label" style="margin-bottom:0" for="cfgMailDomain">邮箱后缀</label>
+                      <button type="button" id="btnFetchDomains" class="btn btn-ghost text-[11px] px-2 py-0.5">拉取</button>
+                    </div>
+                    <div class="c-select" data-select="cfgMailDomain">
+                      <button type="button" class="c-select-btn" id="cfgMailDomainBtn">
+                        <span class="value">自动（服务端默认）</span>
                         <svg class="chev" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.17l3.71-3.94a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clip-rule="evenodd"/></svg>
                       </button>
                       <div class="c-select-menu" role="listbox"></div>
-                      <input type="hidden" id="cfgSolverBrowser" value="camoufox" />
+                      <input type="hidden" id="cfgMailDomain" value="auto" />
                     </div>
+                    <p id="mailDomainHint" class="hint">点「拉取」从 freemail 取可用后缀</p>
+                  </div>
+                </div>
+
+                <!-- 2. 代理 -->
+                <div class="cfg-block">
+                  <h3 class="cfg-title">注册代理</h3>
+                  <div>
+                    <label class="field-label" for="cfgProxy">GROK_PROXY</label>
+                    <input id="cfgProxy" type="text" class="field font-mono text-sm" placeholder="空=直连 · 127.0.0.1:7897" autocomplete="off" spellcheck="false" />
+                    <p class="hint">host:port · http/socks5:// · user:pass@host:port · host:port:user:pass</p>
+                    <div class="mt-1.5 flex items-start gap-2">
+                      <button type="button" id="btnProxyTest" class="btn btn-ghost text-[11px] px-2.5 py-1 shrink-0">测试代理</button>
+                      <div class="flex-1 min-w-0 space-y-0.5">
+                        <p id="proxyEgressLine" class="text-[11px] font-mono leading-snug text-ink-700/45 break-all hidden"></p>
+                        <p id="proxyTestMessage" class="text-[11px] font-mono leading-snug text-ink-700/50 break-all"></p>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- 3. Solver -->
+                <div class="cfg-block">
+                  <h3 class="cfg-title">Turnstile / Solver</h3>
+                  <div>
+                    <label class="field-label">验证码模式</label>
+                    <div class="c-select" data-select="captchaMode">
+                      <button type="button" class="c-select-btn" id="captchaModeBtn">
+                        <span class="value">本地 Turnstile Solver</span>
+                        <svg class="chev" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.17l3.71-3.94a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clip-rule="evenodd"/></svg>
+                      </button>
+                      <div class="c-select-menu" role="listbox"></div>
+                      <input type="hidden" id="captchaMode" value="local" />
+                    </div>
+                  </div>
+                  <div id="yesCaptchaBlock" class="hidden">
+                    <label class="field-label" for="cfgYes">YESCAPTCHA_KEY</label>
+                    <input id="cfgYes" type="text" class="field font-mono text-sm" placeholder="YesCaptcha API Key" autocomplete="off" spellcheck="false" />
                   </div>
                   <div>
-                    <label class="field-label" for="cfgSolverThreads">SOLVER_THREADS</label>
-                    <input id="cfgSolverThreads" class="field font-mono text-sm" type="number" min="1" max="16" placeholder="2" />
+                    <label class="field-label" for="cfgSolver">SOLVER_URL</label>
+                    <input id="cfgSolver" class="field font-mono text-sm" placeholder="http://127.0.0.1:5072" />
+                  </div>
+                  <div class="grid grid-cols-2 gap-2">
+                    <div>
+                      <label class="field-label">BROWSER</label>
+                      <div class="c-select" data-select="cfgSolverBrowser">
+                        <button type="button" class="c-select-btn" id="cfgSolverBrowserBtn">
+                          <span class="value">camoufox</span>
+                          <svg class="chev" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.17l3.71-3.94a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clip-rule="evenodd"/></svg>
+                        </button>
+                        <div class="c-select-menu" role="listbox"></div>
+                        <input type="hidden" id="cfgSolverBrowser" value="camoufox" />
+                      </div>
+                    </div>
+                    <div>
+                      <label class="field-label" for="cfgSolverThreads">THREADS</label>
+                      <input id="cfgSolverThreads" class="field font-mono text-sm" type="number" min="1" max="16" placeholder="2" />
+                    </div>
                   </div>
                 </div>
 
-                <div class="grid grid-cols-2 gap-3">
+                <!-- 4. sub2api -->
+                <div class="cfg-block">
+                  <h3 class="cfg-title">sub2api 导入</h3>
                   <div>
-                    <label class="field-label" for="cfgUiHost">UI_HOST</label>
-                    <input id="cfgUiHost" class="field font-mono text-sm" placeholder="127.0.0.1" />
+                    <label class="field-label" for="cfgUpstreamUrl">SUB2API_URL</label>
+                    <input id="cfgUpstreamUrl" class="field font-mono text-sm" placeholder="http://127.0.0.1:9898" autocomplete="off" />
                   </div>
                   <div>
-                    <label class="field-label" for="cfgUiPort">UI_PORT</label>
-                    <input id="cfgUiPort" class="field font-mono text-sm" placeholder="3333" />
+                    <label class="field-label" for="cfgUpstreamEmail">管理员邮箱</label>
+                    <input id="cfgUpstreamEmail" class="field font-mono text-sm" placeholder="admin@…" autocomplete="username" />
                   </div>
-                </div>
-
-                <div class="pt-2 border-t border-ink-900/5">
-                  <h3 class="font-display font-semibold text-ink-900 text-sm mb-1">注册代理</h3>
-                  <p class="text-[11px] text-ink-700/50 mb-3">same_session / risk / device flow 共用；空=直连。保存写入 <span class="font-mono">GROK_PROXY</span></p>
-                  <div class="space-y-3">
-                    <div>
-                      <label class="field-label" for="cfgProxy">GROK_PROXY</label>
-                      <div class="secret-wrap">
-                        <input id="cfgProxy" type="password" class="field font-mono text-sm" placeholder="127.0.0.1:7897 或 host:port:user:pass" autocomplete="off" />
-                        <button type="button" class="toggle-eye" data-target="cfgProxy">显示</button>
-                      </div>
-                      <p class="mt-1 text-[11px] text-ink-700/45">支持 <span class="font-mono">host:port</span> / <span class="font-mono">http://host:port</span> / <span class="font-mono">user:pass@host:port</span> / <span class="font-mono">host:port:user:pass</span></p>
+                  <div>
+                    <label class="field-label" for="cfgUpstreamPwd">管理员密码</label>
+                    <div class="secret-wrap">
+                      <input id="cfgUpstreamPwd" type="password" class="field font-mono text-sm" placeholder="密码" autocomplete="current-password" spellcheck="false" />
+                      <button type="button" class="toggle-eye" data-target="cfgUpstreamPwd" aria-label="显示/隐藏" title="显示/隐藏">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                      </button>
                     </div>
                   </div>
+                  <div class="grid grid-cols-2 gap-2">
+                    <div>
+                      <label class="field-label" for="cfgGroupName">分组名</label>
+                      <input id="cfgGroupName" class="field font-mono text-sm" placeholder="grok" autocomplete="off" />
+                    </div>
+                    <div>
+                      <label class="field-label" for="cfgGroupId">分组 ID</label>
+                      <input id="cfgGroupId" class="field font-mono text-sm bg-ink-900/5 text-ink-700/70 cursor-not-allowed" placeholder="自动" readonly tabindex="-1" autocomplete="off" />
+                    </div>
+                  </div>
+                  <p id="groupListHint" class="hint min-h-[0.9rem]"></p>
+                  <button type="button" id="btnTestUpstream" class="btn btn-ghost w-full text-[11px] py-1.5">测试 sub2api</button>
+                  <p id="upstreamTestMessage" class="text-[11px] font-mono min-h-[1rem] text-ink-700/50"></p>
                 </div>
 
-                <div class="pt-2 border-t border-ink-900/5">
-                  <h3 class="font-display font-semibold text-ink-900 text-sm mb-1">sub2api Grok（HTTP）</h3>
-                  <p class="text-[11px] text-ink-700/50 mb-3">经 Admin API 的 <span class="font-mono">sso-to-oauth</span> 导入；局域网只需 URL + 管理员账号，无需 Docker</p>
-                  <div class="space-y-3">
+                <!-- 5. UI -->
+                <div class="cfg-block">
+                  <h3 class="cfg-title">控制台监听</h3>
+                  <div class="grid grid-cols-2 gap-2">
                     <div>
-                      <label class="field-label" for="cfgUpstreamUrl">SUB2API_URL</label>
-                      <input id="cfgUpstreamUrl" class="field font-mono text-sm" placeholder="http://127.0.0.1:9898" autocomplete="off" />
-                      <p class="mt-1 text-[11px] text-ink-700/45">HTTP 导入：POST /api/v1/admin/grok/sso-to-oauth</p>
-                    </div>
-                    <div>
-                      <label class="field-label" for="cfgUpstreamEmail">UPSTREAM_ADMIN_EMAIL</label>
-                      <input id="cfgUpstreamEmail" class="field font-mono text-sm" placeholder="管理员邮箱" autocomplete="username" />
+                      <label class="field-label" for="cfgUiHost">UI_HOST</label>
+                      <input id="cfgUiHost" class="field font-mono text-sm" placeholder="127.0.0.1" />
                     </div>
                     <div>
-                      <label class="field-label" for="cfgUpstreamPwd">UPSTREAM_ADMIN_PASSWORD</label>
-                      <div class="secret-wrap">
-                        <input id="cfgUpstreamPwd" type="password" class="field font-mono text-sm" placeholder="管理员密码" autocomplete="current-password" />
-                        <button type="button" class="toggle-eye" data-target="cfgUpstreamPwd">显示</button>
-                      </div>
+                      <label class="field-label" for="cfgUiPort">UI_PORT</label>
+                      <input id="cfgUiPort" class="field font-mono text-sm" placeholder="3333" />
                     </div>
-                    <div class="grid grid-cols-2 gap-3">
-                      <div>
-                        <label class="field-label" for="cfgGroupName">分组名称</label>
-                        <input id="cfgGroupName" class="field font-mono text-sm" placeholder="grok / claude / 任意已有名" autocomplete="off" />
-                        <p class="mt-1 text-[11px] text-ink-700/45">可随意指定已有分组名</p>
-                      </div>
-                      <div>
-                        <label class="field-label" for="cfgGroupId">分组 ID</label>
-                        <input id="cfgGroupId" class="field font-mono text-sm bg-ink-900/5 text-ink-700/70 cursor-not-allowed" placeholder="自动解析" readonly tabindex="-1" autocomplete="off" />
-                        <p class="mt-1 text-[11px] text-ink-700/45">不可编辑 · 保存/测试时自动拉取</p>
-                      </div>
-                    </div>
-                    <p class="text-[11px] text-ink-700/45 -mt-1">按名称匹配 <b>全部</b> 分组（不限 grok），解析后 ID 自动回填；新分组需先在 sub2api 后台创建。导入走 HTTP <span class="font-mono">sso-to-oauth</span></p>
-                    <p id="groupListHint" class="text-[11px] font-mono text-ink-700/40 min-h-[1rem]"></p>
-                    <div class="flex gap-2">
-                      <button type="button" id="btnTestUpstream" class="btn btn-ghost flex-1 text-xs py-2">测试连通性</button>
-                    </div>
-                    <p id="upstreamTestMessage" class="text-[11px] font-mono min-h-[1.1rem] text-ink-700/50"></p>
                   </div>
                 </div>
-
-                <div class="flex gap-3 pt-1">
-                  <button type="submit" id="btnSaveConfig" class="btn btn-primary flex-1">保存配置</button>
-                </div>
-                <p id="configMessage" class="text-xs font-mono min-h-[1.1rem] text-ink-700/50"></p>
               </form>
             </div>
 
@@ -563,10 +618,10 @@
           </div>
         </section>
 
-        <!-- Right: logs -->
-        <section class="lg:col-span-7 space-y-4">
+        <!-- Right: logs (主流程 | risk/token/NSFW) -->
+        <section class="lg:col-span-8 space-y-4 min-w-0">
           <div class="panel rounded-2xl p-5">
-            <div class="flex items-center justify-between mb-3">
+            <div class="flex items-center justify-between mb-3 gap-3 flex-wrap">
               <h2 class="font-display font-semibold text-ink-900">实时日志</h2>
               <div class="flex items-center gap-3">
                 <span id="logConnBadge" class="text-[11px] font-mono text-ink-700/40">连接中…</span>
@@ -577,8 +632,27 @@
                 <button id="btnClearLogs" type="button" class="text-xs font-mono text-ink-700/55 hover:text-sun-500">清空</button>
               </div>
             </div>
-            <div id="logBox" class="h-[28rem] overflow-y-auto rounded-xl bg-paper-50 border border-ink-900/5 p-3 font-mono text-[12px] leading-relaxed space-y-1">
-              <div class="text-ink-700/40">等待日志...</div>
+            <div class="log-split">
+              <!-- 主流程（约 65% 宽，CSS fr 写死，不依赖 xl:col-span） -->
+              <div class="min-w-0">
+                <div class="flex items-center justify-between mb-1.5 px-0.5">
+                  <span class="text-[10px] uppercase tracking-[0.14em] font-semibold text-ink-700/45">主流程</span>
+                  <span class="text-[10px] font-mono text-ink-700/35">建邮 · camoufox · signup · SSO</span>
+                </div>
+                <div id="logBox" class="h-[28rem] overflow-y-auto rounded-xl bg-paper-50 border border-ink-900/5 p-3 font-mono text-[12px] leading-relaxed space-y-1">
+                  <div class="text-ink-700/40">等待主流程日志...</div>
+                </div>
+              </div>
+              <!-- Risk / Token / NSFW（约 35%） -->
+              <div class="min-w-0">
+                <div class="flex items-center justify-between mb-1.5 px-0.5">
+                  <span class="text-[10px] uppercase tracking-[0.14em] font-semibold text-brand-600/80">Risk · Token · NSFW</span>
+                  <span class="text-[10px] font-mono text-ink-700/35">异步后置</span>
+                </div>
+                <div id="postLogBox" class="h-[28rem] overflow-y-auto rounded-xl bg-brand-50/40 border border-brand-500/10 p-3 font-mono text-[12px] leading-relaxed space-y-1">
+                  <div class="text-ink-700/40">risk · 换 token · 协议/NSFW 输出在这里</div>
+                </div>
+              </div>
             </div>
           </div>
 
@@ -599,7 +673,7 @@
       </div>
     </main>
 
-    <footer class="max-w-7xl mx-auto px-4 sm:px-6 pb-8 pt-1 text-center text-[11px] font-mono text-ink-700/40">
+    <footer class="max-w-[1680px] mx-auto px-4 sm:px-6 pb-8 pt-1 text-center text-[11px] font-mono text-ink-700/40">
       仅本机访问 · 也可使用 <span class="text-ink-700/60">python grok.py</span> 命令行
     </footer>
   </div>
@@ -607,10 +681,12 @@
   <script>
     const state = {
       afterId: 0,
+      postAfterId: 0,
       running: false,
       lastStatus: null,
       pollInFlight: false,
       seenLogIds: new Set(),
+      seenPostLogIds: new Set(),
       starting: false,
       importing: false,
       upstreamConfigured: false,
@@ -626,10 +702,13 @@
       const last = entries[entries.length - 1];
       const msg = String((last && last.message) || '');
       const rules = [
-        [/换 token 成功/i, '换 token ✓ · 已缓存'],
-        [/换 token 失败|换 token 异常|换 token 返回体不可用|approve 成功但无 token/i, '换 token ✗ · 导入兜底'],
-        [/换 token 开始/i, '换 token 中…'],
-        [/risk CLEAN/i, 'risk · CLEAN ✓ → 计成功 → 换 token'],
+        [/NSFW\/unhinged 已开|NSFW.*已开/i, 'NSFW ✓ · unhinged'],
+        [/协议\/NSFW 异常|NSFW失败|协议失败|unhinged失败/i, '协议/NSFW ✗'],
+        [/换 token 成功/i, '异步换 token ✓ · 已缓存'],
+        [/换 token 失败|换 token 异常|换 token 返回体不可用|approve 成功但无 token/i, '异步换 token ✗ · 导入兜底'],
+        [/换 token 开始/i, '异步换 token 中…'],
+        [/CLEAN 已计成功 · 换 token/i, 'CLEAN ✓ · token/协议/NSFW 异步中'],
+        [/risk CLEAN/i, 'risk · CLEAN ✓ → 计成功 → 异步 token/NSFW'],
         [/risk MARKED|绕过成功列表/i, 'risk · MARKED · 已绕过（不计成功/不导入）'],
         [/risk 探测开始/i, 'risk 探测中…'],
         [/SSO 到手/i, 'SSO 到手 → risk 门禁'],
@@ -877,34 +956,62 @@
       return data;
     }
 
-    function appendLogs(entries) {
-      if (!entries.length) return;
-      const box = $('logBox');
-      if (box.querySelector('.text-ink-700\\/40') && box.children.length === 1) box.innerHTML = '';
+    function appendLogsToBox(entries, opts) {
+      const {
+        boxId,
+        afterKey,
+        seenKey,
+        emptySelector = '.text-ink-700\\/40',
+        maxChildren = 800,
+      } = opts;
+      if (!entries || !entries.length) return 0;
+      const box = $(boxId);
+      if (!box) return 0;
+      if (box.querySelector(emptySelector) && box.children.length === 1) box.innerHTML = '';
       let added = 0;
+      const seen = state[seenKey];
       for (const e of entries) {
         // 按 id 去重：并发轮询 / 多标签不会刷同一条
         if (e.id != null) {
-          if (state.seenLogIds.has(e.id)) {
-            state.afterId = Math.max(state.afterId, e.id);
+          if (seen.has(e.id)) {
+            state[afterKey] = Math.max(state[afterKey], e.id);
             continue;
           }
-          state.seenLogIds.add(e.id);
-          // 限制集合大小
-          if (state.seenLogIds.size > 2000) {
+          seen.add(e.id);
+          if (seen.size > 2000) {
             const keepFrom = e.id - 1500;
-            state.seenLogIds = new Set([...state.seenLogIds].filter(id => id >= keepFrom));
+            state[seenKey] = new Set([...seen].filter(id => id >= keepFrom));
           }
         }
         const row = document.createElement('div');
         row.className = `log-line ${levelClass[e.level] || levelClass.info}`;
         row.innerHTML = `<span class="text-ink-700/35">[${e.time}]</span> ${escapeHtml(e.message)}`;
         box.appendChild(row);
-        state.afterId = Math.max(state.afterId, e.id || 0);
+        state[afterKey] = Math.max(state[afterKey], e.id || 0);
         added += 1;
       }
-      while (box.children.length > 800) box.removeChild(box.firstChild);
-      if (added && $('autoScroll').checked) box.scrollTop = box.scrollHeight;
+      while (box.children.length > maxChildren) box.removeChild(box.firstChild);
+      if (added && $('autoScroll') && $('autoScroll').checked) {
+        box.scrollTop = box.scrollHeight;
+      }
+      return added;
+    }
+
+    function appendLogs(entries) {
+      return appendLogsToBox(entries, {
+        boxId: 'logBox',
+        afterKey: 'afterId',
+        seenKey: 'seenLogIds',
+      });
+    }
+
+    function appendPostLogs(entries) {
+      return appendLogsToBox(entries, {
+        boxId: 'postLogBox',
+        afterKey: 'postAfterId',
+        seenKey: 'seenPostLogIds',
+        maxChildren: 600,
+      });
     }
 
     function renderStatus(data) {
@@ -934,6 +1041,8 @@
       if ($('statClean')) $('statClean').textContent = data.clean_count ?? 0;
       if ($('statCleanInline')) $('statCleanInline').textContent = data.clean_count ?? 0;
       if ($('statMarked')) $('statMarked').textContent = data.marked_count ?? 0;
+      if ($('statAttemptInline')) $('statAttemptInline').textContent = data.attempt_count ?? 0;
+      if ($('statAttemptTargetInline')) $('statAttemptTargetInline').textContent = data.target_count ?? 0;
 
       state.running = !!data.running;
       if (wasRunning !== state.running) schedulePoll();
@@ -1063,26 +1172,47 @@
       if (state.pollInFlight) return;
       state.pollInFlight = true;
       try {
-        // 先拉状态（轻量），再拉日志；afterId 始终用最新值
+        // 先拉状态（轻量），再拉日志；afterId / postAfterId 分开游标
         const status = await fetchJSON('/api/status');
         renderStatus(status);
         let after = state.afterId;
-        let logs = await fetchJSON(`/api/logs?after_id=${after}&limit=200`);
+        let postAfter = state.postAfterId;
+        let logs = await fetchJSON(
+          `/api/logs?after_id=${after}&post_after_id=${postAfter}&limit=200`
+        );
         // 服务重启后 afterId 会大于 latest_id，必须重置否则永远看不到新日志
-        if (logs.reset || (logs.latest_id != null && after > logs.latest_id)) {
-          state.afterId = 0;
-          state.seenLogIds = new Set();
-          logs = await fetchJSON('/api/logs?after_id=0&limit=200');
+        const needResetMain =
+          logs.reset || (logs.latest_id != null && after > logs.latest_id);
+        const needResetPost =
+          logs.post_reset ||
+          (logs.post_latest_id != null && postAfter > logs.post_latest_id);
+        if (needResetMain || needResetPost) {
+          if (needResetMain) {
+            state.afterId = 0;
+            state.seenLogIds = new Set();
+          }
+          if (needResetPost) {
+            state.postAfterId = 0;
+            state.seenPostLogIds = new Set();
+          }
+          logs = await fetchJSON(
+            `/api/logs?after_id=${state.afterId}&post_after_id=${state.postAfterId}&limit=200`
+          );
         }
         const newLogs = logs.logs || [];
+        const newPostLogs = logs.post_logs || [];
         appendLogs(newLogs);
-        const hint = inferPipelineFromLogs(newLogs);
+        appendPostLogs(newPostLogs);
+        // 流水线 hint：主区 + 副区都参与推断（risk/换 token 在副区）
+        const hint =
+          inferPipelineFromLogs(newPostLogs) ||
+          inferPipelineFromLogs(newLogs);
         if (hint) setPipelineHint(hint);
         else if (state.running && state.lastStatus) {
           const sc = state.lastStatus.success_count ?? 0;
           const tc = state.lastStatus.target_count ?? 0;
           const cc = state.lastStatus.clean_count ?? 0;
-          setPipelineHint(`运行中 · 成功 ${sc}/${tc} · CLEAN ${cc} · 见下方实时日志`);
+          setPipelineHint(`运行中 · 成功 ${sc}/${tc} · CLEAN ${cc} · 见下方双栏日志`);
         }
         state.pollFailCount = 0;
         if (!state.serverConnected) {
@@ -1231,6 +1361,14 @@
         if ($('upstreamTestMessage')) {
           $('upstreamTestMessage').textContent = '';
           $('upstreamTestMessage').className = 'text-[11px] font-mono min-h-[1.1rem] text-ink-700/50';
+        }
+        if ($('proxyTestMessage')) {
+          $('proxyTestMessage').textContent = '';
+          $('proxyTestMessage').className = 'text-[11px] font-mono leading-snug text-ink-700/50 break-all';
+        }
+        if ($('proxyEgressLine')) {
+          $('proxyEgressLine').textContent = '';
+          $('proxyEgressLine').classList.add('hidden');
         }
         // 有 Worker 时自动拉取域名列表
         if (c.WORKER_DOMAIN) {
@@ -1423,6 +1561,100 @@
       }
     }
 
+    function _paintProxyEgress(data) {
+      const eg = $('proxyEgressLine');
+      if (!eg) return;
+      const label = (data && (data.egress_label || data.egress_ip)) || '';
+      if (data && data.egress_ok && label) {
+        const ms = data.egress_ms ? ` · ${data.egress_ms}ms` : '';
+        const src = data.egress_source ? ` · ${data.egress_source}` : '';
+        eg.textContent = `出口 ${label}${ms}${src}`;
+        eg.className = 'text-[11px] font-mono leading-snug text-sky-700/80 break-all';
+        eg.classList.remove('hidden');
+      } else if (data && data.egress_error) {
+        eg.textContent = `出口失败 · ${data.egress_error}`;
+        eg.className = 'text-[11px] font-mono leading-snug text-amber-600 break-all';
+        eg.classList.remove('hidden');
+      } else if (data && !data.egress_ok) {
+        eg.textContent = '出口未知';
+        eg.className = 'text-[11px] font-mono leading-snug text-ink-700/45 break-all';
+        eg.classList.remove('hidden');
+      } else {
+        eg.textContent = '';
+        eg.classList.add('hidden');
+      }
+    }
+
+    function _paintProxyXai(data, failed) {
+      const msg = $('proxyTestMessage');
+      if (!msg) return;
+      if (!data) {
+        msg.textContent = '测试失败';
+        msg.className = 'text-[11px] font-mono leading-snug text-rose-500 break-all';
+        return;
+      }
+      if (data.xai_ok || data.ok) {
+        const st = data.xai_status || data.status || '?';
+        const ms = data.xai_ms != null ? data.xai_ms : data.ms;
+        msg.textContent = `xAI 连通 · HTTP ${st} · ${ms || 0}ms`;
+        msg.className = 'text-[11px] font-mono leading-snug text-leaf-600 break-all';
+        return;
+      }
+      // 有出口但 xAI 挂 / 全挂
+      const err = data.error || (failed && failed.message) || 'xAI 不通';
+      const ms = data.ms != null ? ` · 总 ${data.ms}ms` : '';
+      if (data.egress_ok) {
+        msg.textContent = `xAI 不通 · ${err}${ms}`;
+      } else {
+        msg.textContent = data.message || `探测失败 · ${err}${ms}`;
+      }
+      msg.className = 'text-[11px] font-mono leading-snug text-rose-500 break-all';
+    }
+
+    async function testProxyConnectivity() {
+      const btn = $('btnProxyTest');
+      const msg = $('proxyTestMessage');
+      const eg = $('proxyEgressLine');
+      if (btn) btn.disabled = true;
+      if (eg) {
+        eg.textContent = '① 探测出口 IP / 区域…';
+        eg.className = 'text-[11px] font-mono leading-snug text-ink-700/50 break-all';
+        eg.classList.remove('hidden');
+      }
+      if (msg) {
+        msg.textContent = '② 等待出口后测 x.ai…';
+        msg.className = 'text-[11px] font-mono leading-snug text-ink-700/45 break-all';
+      }
+      try {
+        const data = await fetchJSON('/api/proxy/test', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            // 用输入框当前值（可先测再保存）；空=直连
+            GROK_PROXY: ($('cfgProxy') && $('cfgProxy').value.trim()) || '',
+          }),
+        });
+        _paintProxyEgress(data);
+        _paintProxyXai(data, null);
+      } catch (e) {
+        // fetchJSON 在 502 时抛错，但 body 可能在 e.data
+        const d = e.data || {};
+        _paintProxyEgress(d);
+        if (d && (d.message || d.error || d.egress_ip != null)) {
+          _paintProxyXai(d, e);
+        } else if (msg) {
+          msg.textContent = e.message || '测试失败';
+          msg.className = 'text-[11px] font-mono leading-snug text-rose-500 break-all';
+        }
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    }
+
+    if ($('btnProxyTest')) {
+      $('btnProxyTest').addEventListener('click', () => { testProxyConnectivity(); });
+    }
+
     async function importToUpstream(ids, opts) {
       if (state.importing) return;
       if (!state.upstreamConfigured) {
@@ -1536,20 +1768,31 @@
     $('btnClearLogs').addEventListener('click', async () => {
       try {
         await fetchJSON('/api/logs/clear', { method: 'POST' });
-        $('logBox').innerHTML = '<div class="text-ink-700/40">日志已清空</div>';
+        $('logBox').innerHTML = '<div class="text-ink-700/40">主流程日志已清空</div>';
+        if ($('postLogBox')) {
+          $('postLogBox').innerHTML = '<div class="text-ink-700/40">Risk/换 token 日志已清空</div>';
+        }
         state.afterId = 0;
+        state.postAfterId = 0;
         state.seenLogIds = new Set();
+        state.seenPostLogIds = new Set();
       } catch (e) {
         setMessage($('formMessage'), e.message, false);
       }
     });
 
+    // 密码框眼睛：显示 / 隐藏
+    const EYE_OPEN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
+    const EYE_OFF = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>';
     document.querySelectorAll('.toggle-eye').forEach(btn => {
       btn.addEventListener('click', () => {
         const input = $(btn.dataset.target);
+        if (!input) return;
         const show = input.type === 'password';
         input.type = show ? 'text' : 'password';
-        btn.textContent = show ? '隐藏' : '显示';
+        btn.innerHTML = show ? EYE_OFF : EYE_OPEN;
+        btn.setAttribute('aria-label', show ? '隐藏' : '显示');
+        btn.title = show ? '隐藏' : '显示';
       });
     });
 

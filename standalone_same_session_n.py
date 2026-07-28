@@ -903,8 +903,19 @@ def detect_local_egress(force: bool = False, log_fn: Any = None) -> dict[str, An
         if not info.get("timezone") and fam and fam in _FAMILY_DEFAULTS:
             info["timezone"] = _FAMILY_DEFAULTS[fam]["timezone"]
 
+    # 强刷探测失败时不要覆盖上一份成功缓存。否则会出现：
+    #   启动探到 HK/TW → pick 阶段复探偶发失败 → eg.ok=False →
+    #   local 指纹回退全球池，最终 HK 出口 mint JP/AU 画像。
+    # 这会把 IP/locale/timezone 一致性打穿，增加 MARKED/deny。
     with _LOCAL_EGRESS_LOCK:
-        _LOCAL_EGRESS = dict(info)
+        prev_ok = dict(_LOCAL_EGRESS) if isinstance(_LOCAL_EGRESS, dict) and _LOCAL_EGRESS.get("ok") else None
+        refresh_error = str(info.get("error") or "")
+        if info.get("ok") or not prev_ok:
+            _LOCAL_EGRESS = dict(info)
+        else:
+            info = dict(prev_ok)
+            info["stale"] = True
+            info["refresh_error"] = refresh_error
 
     if log_fn:
         try:
@@ -1844,7 +1855,7 @@ def main() -> int:
             "yes",
             "on",
         )
-        eg = detect_local_egress(force=force_eg or True, log_fn=log)
+        eg = detect_local_egress(force=force_eg, log_fn=log)
         try:
             every_n = int(
                 (os.environ.get("STANDALONE_EGRESS_EVERY") or "3").strip() or "3"

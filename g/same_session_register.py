@@ -73,64 +73,110 @@ def _browser_pool_enabled() -> bool:
 
 
 def _pool_max_uses() -> int:
-    """单 browser 最多服务几号；默认 2。达上限先关再冷启。"""
+    """单 browser 最多服务几号；默认 1（每号冷启，指纹更散）。"""
     try:
         n = int(
             (
                 os.getenv("GROK_SAME_SESSION_BROWSER_POOL_MAX_USES")
                 or os.getenv("GROK_SS_POOL_MAX_USES")
-                or "2"
+                or "1"
             ).strip()
-            or "2"
+            or "1"
         )
     except ValueError:
-        n = 2
+        n = 1
     return max(1, min(8, n))
 
 
 def _pool_force_cold_prob() -> float:
-    """强制换新概率（关旧再启）。默认 0.35。"""
+    """强制换新概率（关旧再启）。默认 0.65，配合限次=1 基本每号新浏览器。"""
     raw = (
         os.getenv("GROK_SAME_SESSION_BROWSER_POOL_COLD_PROB")
         or os.getenv("GROK_SS_POOL_COLD_PROB")
-        or "0.35"
+        or "0.65"
     ).strip()
     try:
         p = float(raw)
     except ValueError:
-        p = 0.35
+        p = 0.65
     return max(0.0, min(1.0, p))
 
 
-def _clear_thread_event_loop() -> None:
+def _clear_thread_event_loop(*, force: bool = False) -> None:
     """
-    Playwright Sync 退出后，线程上可能仍挂着已关闭的 loop。
+    Playwright Sync 退出后，线程上可能仍挂着 loop / _running_loop。
     清掉，避免下一次 Camoufox() 误判「inside asyncio loop」。
+
+    force=True：连「仍标记 running」的残留也清（greenlet 异常退出常见）。
+    会动 asyncio 私有 _set_running_loop，仅用于本线程冷启抢救。
     """
     try:
         import asyncio
+        from asyncio import events as aio_events
 
+        # 1) 先摘掉 thread-local running 标记（Playwright 用 get_running_loop 判死刑）
+        if force:
+            try:
+                setter = getattr(aio_events, "_set_running_loop", None)
+                if callable(setter):
+                    setter(None)
+            except Exception:
+                pass
+
+        loop = None
         try:
             loop = asyncio.get_event_loop_policy().get_event_loop()
         except RuntimeError:
-            return
-        if loop is None:
-            return
-        try:
-            if loop.is_running():
-                # 理论上 Sync 退出后不应仍 running；强行不碰 running loop
-                return
+            loop = None
         except Exception:
-            pass
-        try:
-            if not loop.is_closed():
-                loop.close()
-        except Exception:
-            pass
+            loop = None
+
+        if loop is not None:
+            running = False
+            try:
+                running = bool(loop.is_running())
+            except Exception:
+                running = False
+            if running and force:
+                try:
+                    loop.stop()
+                except Exception:
+                    pass
+            if not running or force:
+                try:
+                    if not loop.is_closed():
+                        # running+force 时 close 可能抛，忽略
+                        loop.close()
+                except Exception:
+                    pass
+
         try:
             asyncio.set_event_loop(None)
         except Exception:
             pass
+
+        # 2) 再装一个全新 loop 立刻卸掉，打断策略缓存
+        try:
+            fresh = asyncio.new_event_loop()
+            asyncio.set_event_loop(fresh)
+            try:
+                fresh.close()
+            except Exception:
+                pass
+            asyncio.set_event_loop(None)
+        except Exception:
+            try:
+                asyncio.set_event_loop(None)
+            except Exception:
+                pass
+
+        if force:
+            try:
+                setter = getattr(aio_events, "_set_running_loop", None)
+                if callable(setter):
+                    setter(None)
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -150,11 +196,12 @@ def _close_pool_entry(ent: Optional[dict[str, Any]], log_fn=None, reason: str = 
             except Exception:
                 pass
     finally:
-        # 关键驱动后清 loop，下一号才能安全冷启
-        _clear_thread_event_loop()
+        # 关闭驱动后必须 force 清（含 _running_loop），否则下号 Sync API 必炸
+        _clear_thread_event_loop(force=True)
         if log_fn and reason:
             try:
-                log_fn(f"camoufox 已关闭 · {reason}")
+                # 文案避免依赖控制台代码页；ASCII 关键词方便 grep
+                log_fn(f"camoufox closed · {reason}")
             except Exception:
                 pass
 
@@ -207,6 +254,9 @@ def _acquire_camoufox_pooled(
     pw_proxy: Optional[dict[str, str]],
     timezone_id: str,
     log_fn,
+    accept_language: Optional[str] = None,
+    languages: Optional[list[str]] = None,
+    device_fp: Optional[dict[str, Any]] = None,
 ) -> tuple[Any, Any, Any, bool, float]:
     """
     返回 (camoufox_cm_or_None, ctx, page, from_pool, launch_s)
@@ -214,32 +264,74 @@ def _acquire_camoufox_pooled(
 
     硬规则：本线程同时最多 1 个存活 Camoufox/Playwright Sync。
     需要换新时先 __exit__ 旧的并清 event loop，再冷启。
+    语言跟随 locale：Accept-Language + navigator.languages。
+    device_fp：WebGL/屏幕/CPU/媒体等设备上下文（一号一换）。
     """
     proxy_server = (pw_proxy or {}).get("server") if pw_proxy else None
     proxy_s = (proxy_server or "direct").strip()
-    loc_main = (locale or "en-US").strip().lower().split(",")[0].strip() or "en-us"
+    lang_pack = locale_language_pack(locale)
+    locale = lang_pack["locale"]
+    al_header = (accept_language or lang_pack["accept_language"]).strip()
+    nav_langs = list(languages or lang_pack["languages"])
+    loc_main = locale.lower()
     tid = threading.get_ident()
     t_launch = time.time()
     max_uses = _pool_max_uses()
     cold_prob = _pool_force_cold_prob()
     pool_on = _browser_pool_enabled()
 
+    # 设备指纹：未传则按 OS+viewport 现生成（保证 Camoufox 总有富上下文）
+    if not device_fp:
+        device_fp = build_device_fingerprint(fp_os_val, viewport=vp)
+    else:
+        # 外部传入时仍保证 viewport 一致
+        if vp and not (device_fp.get("viewport") or {}).get("width"):
+            device_fp = dict(device_fp)
+            device_fp["viewport"] = dict(vp)
+    vp = dict(device_fp.get("viewport") or vp or _rand_viewport())
+    device_fp = dict(device_fp)
+    device_fp["viewport"] = vp
+    device_fp["fp_os"] = (
+        "macos"
+        if str(fp_os_val).lower() in ("mac", "macos", "osx", "darwin")
+        else "windows"
+    )
+    webgl_tag = (
+        f"{str(device_fp.get('webgl_vendor') or '')[:18]}|"
+        f"{str(device_fp.get('webgl_renderer') or '')[:28]}"
+    )
+
     ent = _get_thread_ent()
 
     # 池坏/超次/指纹 OS 或代理变了 → 必须关旧（os/proxy 是 launch 级，不能靠 new_context）
+    # WebGL/screen 也是 launch 级，一号一换设备指纹时直接冷启
     need_drop = False
     drop_reason = ""
     if ent is not None:
         if int(ent.get("owner_tid") or 0) != tid:
             need_drop, drop_reason = True, "owner 不匹配"
         elif int(ent.get("uses") or 0) >= max_uses:
-            need_drop, drop_reason = True, f"达上限 uses={ent.get('uses')}/{max_uses}"
+            need_drop, drop_reason = (
+                True,
+                f"max_uses hit uses={ent.get('uses')}/{max_uses}",
+            )
         elif str(ent.get("fp_os") or "") != fp_os_val:
-            need_drop, drop_reason = True, f"换 OS {ent.get('fp_os')}→{fp_os_val}"
+            need_drop, drop_reason = (
+                True,
+                f"os change {ent.get('fp_os')}->{fp_os_val}",
+            )
         elif str(ent.get("proxy") or "direct").strip() != proxy_s:
-            need_drop, drop_reason = True, "换代理"
+            need_drop, drop_reason = True, "proxy change"
+        # launch 级 locale 与本号不一致 → 冷启（Camoufox 进程语言）
+        elif str(ent.get("locale") or "").lower() != loc_main:
+            need_drop, drop_reason = (
+                True,
+                f"locale change {ent.get('locale')}->{locale}",
+            )
+        elif str(ent.get("webgl_tag") or "") != webgl_tag:
+            need_drop, drop_reason = True, "device/webgl change"
         elif not ent.get("is_browser") or ent.get("browser") is None:
-            need_drop, drop_reason = True, "browser 无效"
+            need_drop, drop_reason = True, "browser invalid"
 
     force_cold = (not pool_on) or (random.random() < cold_prob)
     if force_cold and ent is not None and pool_on:
@@ -250,24 +342,27 @@ def _acquire_camoufox_pooled(
         _drop_thread_pool(log_fn, reason=drop_reason)
         ent = None
 
-    # —— 尝试复用（仅 new_context：locale/timezone/viewport 可每号不同）——
+    ctx_kw = _context_locale_kwargs(
+        locale, timezone_id, vp, accept_language=al_header
+    )
+
+    # —— 尝试复用（仅 new_context：locale/timezone/viewport/语言头 可每号不同）——
     if pool_on and ent is not None and not force_cold:
         browser = ent.get("browser")
         try:
             if ent.get("is_browser") and hasattr(browser, "new_context"):
-                ctx = browser.new_context(
-                    viewport={"width": int(vp["width"]), "height": int(vp["height"])},
-                    locale=locale,
-                    timezone_id=timezone_id,
-                )
+                ctx = browser.new_context(**ctx_kw)
                 page = ctx.new_page()
+                _apply_navigator_languages(page, nav_langs, lang_pack["lang"])
+                _apply_device_context(page, device_fp)
                 ent["uses"] = int(ent.get("uses") or 0) + 1
                 ent["locale"] = loc_main
                 uses_now = int(ent["uses"])
                 launch_s = round(time.time() - t_launch, 2)
                 log_fn(
                     f"camoufox 池复用 · tid={tid} · gen={ent.get('gen')} · "
-                    f"{fp_os_val}/{locale} · #{uses_now}/{max_uses} · {launch_s}s"
+                    f"{fp_os_val}/{locale} · al={al_header[:32]} · "
+                    f"#{uses_now}/{max_uses} · {launch_s}s"
                 )
                 return None, ctx, page, True, launch_s
         except Exception as e:
@@ -279,15 +374,21 @@ def _acquire_camoufox_pooled(
     if _get_thread_ent() is not None:
         _drop_thread_pool(log_fn, reason="冷启前残留清理")
     else:
-        # 即便池空，也可能有脏 loop
-        _clear_thread_event_loop()
+        # 即便池空，也可能有脏 loop（池线程复用）
+        _clear_thread_event_loop(force=True)
 
     from camoufox.sync_api import Camoufox
 
     gen = _next_gen(tid)
+    scr = device_fp.get("screen") or {}
     log_fn(
         f"启动 camoufox · tid={tid} · gen={gen} · {fp_os_val}/{locale} · "
-        f"vp={int(vp['width'])}x{int(vp['height'])}"
+        f"lang={lang_pack['lang']} · al={al_header[:40]} · "
+        f"vp={int(vp['width'])}x{int(vp['height'])} · "
+        f"screen={int(scr.get('width') or 0)}x{int(scr.get('height') or 0)} · "
+        f"dpr={device_fp.get('device_pixel_ratio')} · "
+        f"hw={device_fp.get('hardware_concurrency')} · "
+        f"gpu={str(device_fp.get('webgl_renderer') or '')[:36]}"
     )
     fox_kwargs: dict[str, Any] = {
         "headless": True,
@@ -296,29 +397,118 @@ def _acquire_camoufox_pooled(
         "humanize": bool(humanize_val),
         "window": (int(vp["width"]), int(vp["height"])),
         "block_webrtc": True,
+        "block_webgl": False,
     }
+    # 富设备指纹：WebGL / screen / hardware / media / canvas / audio
+    try:
+        fox_kwargs.update(device_fp_camoufox_kwargs(device_fp))
+    except Exception as _df_err:
+        try:
+            log_fn(f"device_fp 映射跳过 · {_compact_log(_df_err, 60)}")
+        except Exception:
+            pass
+    # 部分 camoufox 版本支持 languages；不支持则忽略
+    try:
+        fox_kwargs["locale"] = locale
+    except Exception:
+        pass
     if pw_proxy:
         fox_kwargs["proxy"] = pw_proxy
-        fox_kwargs["geoip"] = True
+        # geoip=True：Camoufox 经代理查出口 IP，对齐 locale/时区，并消掉 LeakWarning。
+        # 远程代理（1024 等）常「Failed to get IP」→ 冷启失败，故：
+        #   本机 127.0.0.1/localhost 默认开；其它出口默认关。
+        # 强制：GROK_CAMOUFOX_GEOIP=1/0
+        _geo_env = (os.getenv("GROK_CAMOUFOX_GEOIP") or "").strip().lower()
+        if _geo_env in ("1", "true", "yes", "on"):
+            fox_kwargs["geoip"] = True
+        elif _geo_env in ("0", "false", "no", "off"):
+            fox_kwargs["geoip"] = False
+        else:
+            _ps = str(
+                (pw_proxy.get("server") if isinstance(pw_proxy, dict) else pw_proxy) or ""
+            ).lower()
+            _local = any(
+                h in _ps
+                for h in ("127.0.0.1", "localhost", "[::1]", "0.0.0.0")
+            )
+            fox_kwargs["geoip"] = bool(_local)
 
     t_launch = time.time()
     last_err: Optional[BaseException] = None
     camoufox_cm = None
     camoufox_browser = None
-    for attempt in range(1, 3):
+
+    def _is_sync_loop_err(err: BaseException) -> bool:
+        msg = str(err or "")
+        return (
+            "asyncio loop" in msg
+            or "Async API" in msg
+            or "Sync API" in msg
+            or "Playwright Sync" in msg
+        )
+
+    def _is_proxy_geoip_err(err: BaseException) -> bool:
+        msg = str(err or "").lower()
+        return (
+            "failed to get ip" in msg
+            or "get ip address" in msg
+            or "geoip" in msg
+        )
+
+    def _try_enter_once() -> tuple[Any, Any]:
+        """
+        在「干净」状态下进 Camoufox。若本线程 get_running_loop 仍活着，
+        Playwright Sync 会直接拒绝——先 force 清再进。
+        """
+        import asyncio
+
+        _clear_thread_event_loop(force=True)
+        # 探测：若仍能 get_running_loop，再清一轮
+        for _ in range(3):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                break
+            _clear_thread_event_loop(force=True)
+            time.sleep(0.05)
+        else:
+            # 仍 running：最后手段再清
+            _clear_thread_event_loop(force=True)
+        import warnings
+
+        # 有代理但未开 geoip 时 Camoufox 喷 LeakWarning(RuntimeWarning) 到 stderr；
+        # PowerShell 会当 NativeCommandError 再乱码。本机 7897 已默认 geoip，
+        # 远程代理关 geoip 时也压掉这条提示（locale/tz 我们自己注入）。
         try:
-            _clear_thread_event_loop()
-            camoufox_cm = Camoufox(**fox_kwargs)
-            camoufox_browser = camoufox_cm.__enter__()
+            from camoufox.warnings import LeakWarning as _CamoufoxLeakWarning
+        except Exception:
+            _CamoufoxLeakWarning = RuntimeWarning  # type: ignore[misc, assignment]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=_CamoufoxLeakWarning)
+            warnings.filterwarnings(
+                "ignore",
+                message=r".*geoip=True.*",
+                category=Warning,
+            )
+            cm = Camoufox(**fox_kwargs)
+            browser = cm.__enter__()
+        return cm, browser
+
+    # 冷启：最多 5 次，全部 force 清 loop（池复用线程必脏）
+    _clear_thread_event_loop(force=True)
+    for attempt in range(1, 6):
+        try:
+            if _get_thread_ent() is not None:
+                _drop_thread_pool(log_fn, reason="启动前仍有残留池")
+                _clear_thread_event_loop(force=True)
+            camoufox_cm, camoufox_browser = _try_enter_once()
             last_err = None
             break
         except BaseException as e:
             last_err = e
-            msg = str(e)
-            # 典型：旧 loop 没清干净 / 同线程双开
-            if "asyncio loop" in msg or "Async API" in msg:
+            if _is_sync_loop_err(e):
                 log_fn(
-                    f"camoufox Sync/loop 冲突 try#{attempt} · 清 loop 重试 · "
+                    f"camoufox Sync/loop 冲突 try#{attempt}/5 · force清loop · "
                     f"{_compact_log(e, 80)}"
                 )
                 try:
@@ -328,25 +518,95 @@ def _acquire_camoufox_pooled(
                     pass
                 camoufox_cm = None
                 camoufox_browser = None
-                _clear_thread_event_loop()
-                time.sleep(0.15 * attempt)
+                _drop_thread_pool(log_fn, reason="loop冲突回收")
+                _clear_thread_event_loop(force=True)
+                time.sleep(0.25 * attempt)
                 continue
+            # WebGL pair 不在 camoufox db → 回退 M1 / 去掉 webgl_config 再启
+            _em = str(e or "").lower()
+            if "no webgl data" in _em or "webgl data found" in _em:
+                log_fn(
+                    f"camoufox WebGL 库无此卡 try#{attempt}/5 · "
+                    f"回退 Apple M1 · {_compact_log(e, 100)}"
+                )
+                fox_kwargs["webgl_config"] = (
+                    "Apple",
+                    "Apple M1, or similar",
+                )
+                # 若仍失败，下一轮可 pop；本轮先钉死 M1
+                if attempt >= 3:
+                    fox_kwargs.pop("webgl_config", None)
+                try:
+                    if camoufox_cm is not None:
+                        camoufox_cm.__exit__(None, None, None)
+                except Exception:
+                    pass
+                camoufox_cm = None
+                camoufox_browser = None
+                _drop_thread_pool(log_fn, reason="webgl库无")
+                _clear_thread_event_loop(force=True)
+                time.sleep(0.2 * attempt)
+                continue
+            if _is_proxy_geoip_err(e) and fox_kwargs.get("geoip"):
+                # 远程代理 geoip 探测失败：关 geoip 再试（locale/tz 仍用注入值）
+                log_fn(
+                    f"camoufox geoip 失败 try#{attempt}/5 · 关 geoip 重试 · "
+                    f"{_compact_log(e, 80)}"
+                )
+                fox_kwargs["geoip"] = False
+                try:
+                    if camoufox_cm is not None:
+                        camoufox_cm.__exit__(None, None, None)
+                except Exception:
+                    pass
+                camoufox_cm = None
+                camoufox_browser = None
+                _drop_thread_pool(log_fn, reason="geoip失败")
+                _clear_thread_event_loop(force=True)
+                time.sleep(0.3 * attempt)
+                continue
+            if _is_proxy_geoip_err(e) and attempt < 5:
+                log_fn(
+                    f"camoufox 代理/IP 探测失败 try#{attempt}/5 · "
+                    f"{_compact_log(e, 80)}"
+                )
+                try:
+                    if camoufox_cm is not None:
+                        camoufox_cm.__exit__(None, None, None)
+                except Exception:
+                    pass
+                camoufox_cm = None
+                camoufox_browser = None
+                _drop_thread_pool(log_fn, reason="代理IP失败")
+                _clear_thread_event_loop(force=True)
+                time.sleep(0.5 * attempt)
+                continue
+            # 非可恢复错误直接抛
+            try:
+                if camoufox_cm is not None:
+                    camoufox_cm.__exit__(None, None, None)
+            except Exception:
+                pass
             raise
     if last_err is not None or camoufox_cm is None or camoufox_browser is None:
-        _clear_thread_event_loop()
+        _clear_thread_event_loop(force=True)
         raise last_err or RuntimeError("camoufox 启动失败")
 
     is_browser = hasattr(camoufox_browser, "new_context")
     if is_browser:
-        ctx = camoufox_browser.new_context(
-            viewport={"width": int(vp["width"]), "height": int(vp["height"])},
-            locale=locale,
-            timezone_id=timezone_id,
-        )
+        ctx = camoufox_browser.new_context(**ctx_kw)
         page = ctx.new_page()
+        _apply_navigator_languages(page, nav_langs, lang_pack["lang"])
+        _apply_device_context(page, device_fp)
     else:
         ctx = camoufox_browser
         page = ctx.new_page()
+        try:
+            ctx.set_extra_http_headers({"Accept-Language": al_header})
+        except Exception:
+            pass
+        _apply_navigator_languages(page, nav_langs, lang_pack["lang"])
+        _apply_device_context(page, device_fp)
     launch_s = round(time.time() - t_launch, 2)
     log_fn(f"camoufox 就绪 · tid={tid} · gen={gen} · {launch_s}s")
 
@@ -361,6 +621,7 @@ def _acquire_camoufox_pooled(
                 "fp_os": fp_os_val,
                 "locale": loc_main,
                 "proxy": proxy_s,
+                "webgl_tag": webgl_tag,
                 "gen": gen,
                 "born": time.time(),
             }
@@ -396,6 +657,19 @@ def _compact_log(msg: Any, max_len: int = 160) -> str:
     return s
 
 
+def _default_proxy_scheme() -> str:
+    """
+    无 scheme 的 host:port:user:pass 默认协议。
+    1024proxy 等 socket 池是 socks5；本机 mixed 口多为 http。
+    覆盖：GROK_PROXY_SCHEME=socks5|http
+    """
+    raw = (os.getenv("GROK_PROXY_SCHEME") or os.getenv("STANDALONE_PROXY_SCHEME") or "").strip().lower()
+    if raw in ("socks5", "socks5h", "socks4", "http", "https"):
+        return "socks5h" if raw == "socks5" else raw
+    # 启发式：文件/环境没写时，远程商用口默认 socks5h（DNS 走代理）
+    return "http"
+
+
 def parse_proxy_spec(spec: str) -> Optional[dict[str, str]]:
     """
     解析代理配置，支持:
@@ -403,12 +677,36 @@ def parse_proxy_spec(spec: str) -> Optional[dict[str, str]]:
       user:pass@host:port
       http://user:pass@host:port
       socks5://user:pass@host:port
+      socks5h://user:pass@host:port
     返回 Playwright proxy dict: {server, username?, password?}
     以及 server_url（带鉴权的完整 URL，给 curl 用）。
+    无 scheme 时：GROK_PROXY_SCHEME / STANDALONE_PROXY_SCHEME（默认 http；
+    socket 池写入时会带 socks5h:// 前缀）。
     """
     s = (spec or "").strip()
     if not s:
         return None
+    default_scheme = _default_proxy_scheme()
+
+    def _pack(scheme: str, host: str, port: str, user: str = "", pw: str = "") -> dict[str, str]:
+        from urllib.parse import quote
+
+        sch = (scheme or default_scheme or "http").lower()
+        if sch == "socks5":
+            sch = "socks5h"  # 远程解析走代理，避 DNS 泄露/污染
+        server = f"{sch}://{host}:{port}"
+        out: dict[str, str] = {"server": server, "scheme": sch}
+        if user:
+            out["username"] = user
+            out["password"] = pw or ""
+            out["server_url"] = (
+                f"{sch}://{quote(user, safe='')}:{quote(pw or '', safe='')}@"
+                f"{host}:{port}"
+            )
+        else:
+            out["server_url"] = server
+        return out
+
     # 完整 URL
     if "://" in s:
         # http://user:pass@host:port
@@ -422,25 +720,13 @@ def parse_proxy_spec(spec: str) -> Optional[dict[str, str]]:
         if not m:
             # 无端口也接受
             return {"server": s, "server_url": s}
-        scheme = m.group("scheme")
-        host = m.group("host")
-        port = m.group("port")
-        user = m.group("user")
-        pw = m.group("pass")
-        server = f"{scheme}://{host}:{port}"
-        out = {"server": server}
-        if user:
-            out["username"] = user
-            out["password"] = pw or ""
-            from urllib.parse import quote
-
-            out["server_url"] = (
-                f"{scheme}://{quote(user, safe='')}:{quote(pw or '', safe='')}@"
-                f"{host}:{port}"
-            )
-        else:
-            out["server_url"] = server
-        return out
+        return _pack(
+            m.group("scheme"),
+            m.group("host"),
+            m.group("port"),
+            m.group("user") or "",
+            m.group("pass") or "",
+        )
 
     # user:pass@host:port
     if "@" in s:
@@ -448,17 +734,7 @@ def parse_proxy_spec(spec: str) -> Optional[dict[str, str]]:
         if ":" in cred and ":" in hostport:
             user, pw = cred.split(":", 1)
             host, port = hostport.rsplit(":", 1)
-            from urllib.parse import quote
-
-            server = f"http://{host}:{port}"
-            return {
-                "server": server,
-                "username": user,
-                "password": pw,
-                "server_url": (
-                    f"http://{quote(user, safe='')}:{quote(pw, safe='')}@{host}:{port}"
-                ),
-            }
+            return _pack(default_scheme, host, port, user, pw)
 
     # host:port:user:pass  （user 可能含冒号以外字符，port 是数字段）
     parts = s.split(":")
@@ -470,22 +746,11 @@ def parse_proxy_spec(spec: str) -> Optional[dict[str, str]]:
         user = ":".join(parts[2:-1])
         pw = parts[-1]
         if port.isdigit():
-            from urllib.parse import quote
-
-            server = f"http://{host}:{port}"
-            return {
-                "server": server,
-                "username": user,
-                "password": pw,
-                "server_url": (
-                    f"http://{quote(user, safe='')}:{quote(pw, safe='')}@{host}:{port}"
-                ),
-            }
+            return _pack(default_scheme, host, port, user, pw)
 
     # host:port
     if len(parts) == 2 and parts[1].isdigit():
-        server = f"http://{parts[0]}:{parts[1]}"
-        return {"server": server, "server_url": server}
+        return _pack(default_scheme, parts[0], parts[1])
     return None
 
 
@@ -1052,22 +1317,509 @@ def _ts_parallel_enabled() -> bool:
     return raw not in ("0", "false", "off", "no")
 
 
+# 常见物理屏（宽x高），按 OS 加权；viewport 会略小于 screen（扣任务栏/Dock）
+_SCREEN_PRESETS_WIN: list[tuple[int, int, float]] = [
+    (1366, 768, 18),
+    (1440, 900, 10),
+    (1536, 864, 12),
+    (1600, 900, 10),
+    (1680, 1050, 8),
+    (1920, 1080, 28),
+    (1920, 1200, 8),
+    (2560, 1440, 6),
+]
+_SCREEN_PRESETS_MAC: list[tuple[int, int, float]] = [
+    (1280, 800, 6),
+    (1440, 900, 12),
+    (1470, 956, 14),  # MBA/MBP scaled
+    (1512, 982, 14),
+    (1680, 1050, 8),
+    (1728, 1117, 12),
+    (1920, 1080, 10),
+    (2560, 1600, 8),
+    (3008, 1692, 4),
+]
+
+# WebGL 白名单（避开 SwiftShader / Basic Render / 古董卡，减虚拟机感）
+_WEBGL_WIN: list[tuple[str, str, float]] = [
+    (
+        "Google Inc. (NVIDIA)",
+        "ANGLE (NVIDIA, NVIDIA GeForce GTX 980 Direct3D11 vs_5_0 ps_5_0), or similar",
+        22,
+    ),
+    (
+        "Google Inc. (NVIDIA)",
+        "ANGLE (NVIDIA, NVIDIA GeForce GTX 480 Direct3D11 vs_5_0 ps_5_0), or similar",
+        8,
+    ),
+    (
+        "Google Inc. (Intel)",
+        "ANGLE (Intel, Intel(R) HD Graphics Direct3D11 vs_5_0 ps_5_0), or similar",
+        20,
+    ),
+    (
+        "Google Inc. (Intel)",
+        "ANGLE (Intel, Intel(R) HD Graphics 400 Direct3D11 vs_5_0 ps_5_0), or similar",
+        16,
+    ),
+    (
+        "Google Inc. (AMD)",
+        "ANGLE (AMD, Radeon R9 200 Series Direct3D11 vs_5_0 ps_5_0), or similar",
+        12,
+    ),
+    (
+        "Google Inc. (AMD)",
+        "ANGLE (AMD, Radeon HD 3200 Graphics Direct3D11 vs_5_0 ps_5_0), or similar",
+        6,
+    ),
+]
+# macOS WebGL 必须落在 Camoufox webgl_data.db 的 (vendor,renderer) 上，
+# 否则启动直接炸：No WebGL data found for vendor "Apple" and renderer "Apple M2…"
+# 本机 db 实测 mac 仅：M1 / Intel HD 400 / Intel HD / Radeon R9 / 极低权 ANGLE-NVIDIA
+# 禁止自造 M2/M3/M1 Pro/Iris——库里没有。
+_WEBGL_MAC: list[tuple[str, str, float]] = [
+    # 几乎纯 M1（Camoufox db 主条目）；少量库内 Intel/AMD 老 Mac 兜底
+    ("Apple", "Apple M1, or similar", 94),
+    ("Intel Inc.", "Intel(R) HD Graphics 400, or similar", 3),
+    ("ATI Technologies Inc.", "Radeon R9 200 Series, or similar", 2),
+    ("Intel Inc.", "Intel(R) HD Graphics, or similar", 1),
+    # 不抽 mac 上的 ANGLE-NVIDIA（画像拧，虽库内有极低权重）
+]
+
+# 真机常见 CPU 线程
+_HW_CONCURRENCY_WIN = [(4, 15), (6, 12), (8, 35), (12, 25), (16, 10), (20, 3)]
+_HW_CONCURRENCY_MAC = [(8, 40), (10, 25), (12, 20), (16, 12), (24, 3)]
+
+
+def _weighted_choice(items: list[tuple[Any, float]]) -> Any:
+    if not items:
+        raise ValueError("empty weighted choice")
+    weights = [max(0.0, float(w)) for _, w in items]
+    total = sum(weights) or 1.0
+    r = random.random() * total
+    acc = 0.0
+    for val, w in items:
+        acc += max(0.0, float(w))
+        if r <= acc:
+            return val
+    return items[-1][0]
+
+
 def _rand_viewport() -> dict[str, int]:
-    # 常见桌面分辨率附近抖动，避免固定 1365x900 指纹簇
-    bases = [
-        (1366, 768),
-        (1440, 900),
-        (1536, 864),
-        (1600, 900),
-        (1680, 1050),
-        (1920, 1080),
-        (1280, 800),
-        (1280, 720),
-    ]
-    w, h = random.choice(bases)
-    w += random.randint(-12, 12)
-    h += random.randint(-10, 10)
-    return {"width": max(1100, w), "height": max(700, h)}
+    """兼容旧调用：随机一个桌面 viewport（不绑 screen 时用）。"""
+    profile = build_device_fingerprint("windows")
+    return dict(profile["viewport"])
+
+
+def build_device_fingerprint(
+    fp_os: str = "windows",
+    *,
+    viewport: Optional[dict[str, int]] = None,
+) -> dict[str, Any]:
+    """
+    一号一套「设备上下文」：屏幕、窗口、DPR、WebGL 显卡、CPU 线程、
+    媒体设备、Canvas/Audio seed、触控点等，喂给 Camoufox config。
+
+    说明：
+      - 浏览器 JS **读不到网卡 MAC**，硬编 MAC 只会露馅，故不伪造。
+      - WebRTC 仍 block，避免本机 IP/内网地址泄漏。
+      - deviceMemory 非 Camoufox 原生字段，靠 init script 补齐。
+    """
+    os_l = (fp_os or "windows").strip().lower()
+    is_mac = os_l in ("mac", "macos", "osx", "darwin")
+    screens = _SCREEN_PRESETS_MAC if is_mac else _SCREEN_PRESETS_WIN
+    sw, sh = _weighted_choice([( (w, h), wt) for w, h, wt in screens])
+    # 任务栏 / Dock 占用
+    chrome_h = random.randint(40, 88) if not is_mac else random.randint(28, 72)
+    chrome_w = random.randint(0, 16)
+    if viewport and viewport.get("width") and viewport.get("height"):
+        vw = max(1100, int(viewport["width"]))
+        vh = max(700, int(viewport["height"]))
+        # 若外部 viewport 大于 screen，抬高 screen
+        sw = max(sw, vw + chrome_w)
+        sh = max(sh, vh + chrome_h)
+    else:
+        vw = max(1100, sw - chrome_w - random.randint(0, 48))
+        vh = max(700, sh - chrome_h - random.randint(0, 24))
+        # 轻微抖动，避免整批同一窗口
+        vw += random.randint(-12, 12)
+        vh += random.randint(-10, 10)
+        vw = max(1100, min(vw, sw - 8))
+        vh = max(700, min(vh, sh - 24))
+
+    dpr_pool = (
+        [(2.0, 55), (1.0, 10), (1.5, 5), (2.0, 30)]
+        if is_mac
+        else [(1.0, 55), (1.25, 20), (1.5, 15), (2.0, 10)]
+    )
+    dpr = float(_weighted_choice(dpr_pool))
+    cores = int(
+        _weighted_choice(_HW_CONCURRENCY_MAC if is_mac else _HW_CONCURRENCY_WIN)
+    )
+    # 设备内存 GB（Navigator.deviceMemory 常见枚举）
+    mem = int(
+        _weighted_choice(
+            [(4, 15), (8, 50), (16, 30), (32, 5)] if not is_mac else [(8, 40), (16, 45), (32, 15)]
+        )
+    )
+    webgl_pool = _WEBGL_MAC if is_mac else _WEBGL_WIN
+    vendor, renderer = _weighted_choice(
+        [((v, r), wt) for v, r, wt in webgl_pool]
+    )
+    # OS↔GPU：必须是 Camoufox 库内 pair；未知串一律回退（防 No WebGL data found）
+    if is_mac:
+        allowed = {(v, r) for v, r, _ in _WEBGL_MAC}
+        if (vendor, renderer) not in allowed:
+            vendor, renderer = "Apple", "Apple M1, or similar"
+    else:
+        allowed = {(v, r) for v, r, _ in _WEBGL_WIN}
+        r_low = str(renderer or "").lower()
+        if (vendor, renderer) not in allowed or (
+            "apple m" in r_low and "angle" not in r_low
+        ):
+            vendor, renderer = _WEBGL_WIN[0][0], _WEBGL_WIN[0][1]
+    color_depth = 24
+    max_touch = 0  # 桌面
+    micros = 1 if random.random() < 0.92 else 0
+    speakers = 2 if random.random() < 0.85 else 1
+    webcams = 1 if random.random() < (0.55 if is_mac else 0.35) else 0
+    sample_rate = 48000 if random.random() < 0.65 else 44100
+    max_ch = int(_weighted_choice([(2, 70), (6, 15), (8, 15)]))
+    canvas_seed = random.randint(1, 2_147_483_647)
+    audio_seed = random.randint(1, 2_147_483_647)
+    hist_len = random.randint(1, 5)
+
+    return {
+        "fp_os": "macos" if is_mac else "windows",
+        "screen": {"width": int(sw), "height": int(sh)},
+        "viewport": {"width": int(vw), "height": int(vh)},
+        "window": {"width": int(vw), "height": int(vh)},
+        "device_pixel_ratio": dpr,
+        "color_depth": color_depth,
+        "hardware_concurrency": cores,
+        "device_memory_gb": mem,
+        "max_touch_points": max_touch,
+        "webgl_vendor": vendor,
+        "webgl_renderer": renderer,
+        "media_micros": micros,
+        "media_speakers": speakers,
+        "media_webcams": webcams,
+        "audio_sample_rate": sample_rate,
+        "audio_max_channels": max_ch,
+        "canvas_seed": canvas_seed,
+        "audio_seed": audio_seed,
+        "history_length": hist_len,
+    }
+
+
+def device_fp_camoufox_kwargs(device_fp: dict[str, Any]) -> dict[str, Any]:
+    """
+    把 build_device_fingerprint 结果映射成 Camoufox(**kwargs) 片段。
+
+    注意：不要用过紧的 browserforge Screen 约束——会和 window/os 组合
+    撞成「No headers can be generated」。屏幕尺寸一律走 config 覆盖。
+    """
+    if not device_fp:
+        return {}
+    sw = int((device_fp.get("screen") or {}).get("width") or 1920)
+    sh = int((device_fp.get("screen") or {}).get("height") or 1080)
+    win = device_fp.get("window") or device_fp.get("viewport") or {}
+    ww = int(win.get("width") or 1440)
+    wh = int(win.get("height") or 900)
+    # window 不得大于 screen（BrowserForge 常识）
+    ww = max(1100, min(ww, sw))
+    wh = max(700, min(wh, sh - 20))
+    vendor = str(device_fp.get("webgl_vendor") or "").strip()
+    renderer = str(device_fp.get("webgl_renderer") or "").strip()
+    out: dict[str, Any] = {
+        "window": (ww, wh),
+        "block_webgl": False,
+    }
+    # 宽松 screen 上限，仅作生成器天花板；真实值由 config 钉死
+    try:
+        from browserforge.fingerprints import Screen
+
+        out["screen"] = Screen(
+            min_width=1024,
+            max_width=max(sw, 3840),
+            min_height=700,
+            max_height=max(sh, 2160),
+        )
+    except Exception:
+        pass
+    if vendor and renderer:
+        out["webgl_config"] = (vendor, renderer)
+
+    avail_h = max(600, sh - random.randint(0, 48))
+    cfg: dict[str, Any] = {
+        "navigator.hardwareConcurrency": int(
+            device_fp.get("hardware_concurrency") or 8
+        ),
+        "navigator.maxTouchPoints": int(device_fp.get("max_touch_points") or 0),
+        "window.devicePixelRatio": float(device_fp.get("device_pixel_ratio") or 1.0),
+        "screen.colorDepth": int(device_fp.get("color_depth") or 24),
+        "screen.pixelDepth": int(device_fp.get("color_depth") or 24),
+        "screen.width": sw,
+        "screen.height": sh,
+        "screen.availWidth": sw,
+        "screen.availHeight": avail_h,
+        "screen.availLeft": 0,
+        "screen.availTop": 0,
+        "window.outerWidth": ww,
+        "window.outerHeight": wh,
+        "window.innerWidth": max(800, ww - random.randint(0, 2)),
+        "window.innerHeight": max(600, wh - random.randint(0, 8)),
+        "window.history.length": int(device_fp.get("history_length") or 2),
+        "mediaDevices:enabled": True,
+        "mediaDevices:micros": int(device_fp.get("media_micros") or 1),
+        "mediaDevices:speakers": int(device_fp.get("media_speakers") or 2),
+        "mediaDevices:webcams": int(device_fp.get("media_webcams") or 0),
+        "canvas:seed": int(device_fp.get("canvas_seed") or random.randint(1, 10**9)),
+        "canvas:aaOffset": random.randint(-50, 50),
+        "canvas:aaCapOffset": True,
+        "audio:seed": int(device_fp.get("audio_seed") or random.randint(1, 10**9)),
+        "AudioContext:sampleRate": int(device_fp.get("audio_sample_rate") or 48000),
+        "AudioContext:maxChannelCount": int(device_fp.get("audio_max_channels") or 2),
+        "AudioContext:outputLatency": round(random.uniform(0.01, 0.05), 4),
+    }
+    out["config"] = cfg
+    # 手动 config 会触发 LeakWarning；声明我们清楚在做指纹拼装
+    out["i_know_what_im_doing"] = True
+    return out
+
+
+def _apply_device_context(page, device_fp: Optional[dict[str, Any]]) -> None:
+    """
+    补 Camoufox 不一定覆盖的上下文：deviceMemory、userAgentData 粗糙位、
+    以及 screen/viewport 一致性兜底（双保险）。
+    """
+    if not device_fp or page is None:
+        return
+    try:
+        mem = int(device_fp.get("device_memory_gb") or 8)
+        cores = int(device_fp.get("hardware_concurrency") or 8)
+        dpr = float(device_fp.get("device_pixel_ratio") or 1.0)
+        max_touch = int(device_fp.get("max_touch_points") or 0)
+        sw = int((device_fp.get("screen") or {}).get("width") or 0)
+        sh = int((device_fp.get("screen") or {}).get("height") or 0)
+        platform = (
+            "MacIntel"
+            if str(device_fp.get("fp_os") or "").lower().startswith("mac")
+            else "Win32"
+        )
+        vendor = json.dumps(str(device_fp.get("webgl_vendor") or ""), ensure_ascii=False)
+        renderer = json.dumps(
+            str(device_fp.get("webgl_renderer") or ""), ensure_ascii=False
+        )
+        page.add_init_script(
+            f"""(() => {{
+              try {{
+                const mem = {mem};
+                const cores = {cores};
+                const dpr = {dpr};
+                const maxTouch = {max_touch};
+                const sw = {sw};
+                const sh = {sh};
+                const platform = {json.dumps(platform)};
+                const glVendor = {vendor};
+                const glRenderer = {renderer};
+                try {{
+                  Object.defineProperty(Navigator.prototype, 'deviceMemory', {{
+                    get: () => mem, configurable: true
+                  }});
+                }} catch (e) {{}}
+                try {{
+                  Object.defineProperty(Navigator.prototype, 'hardwareConcurrency', {{
+                    get: () => cores, configurable: true
+                  }});
+                }} catch (e) {{}}
+                try {{
+                  Object.defineProperty(Navigator.prototype, 'maxTouchPoints', {{
+                    get: () => maxTouch, configurable: true
+                  }});
+                }} catch (e) {{}}
+                try {{
+                  Object.defineProperty(Navigator.prototype, 'platform', {{
+                    get: () => platform, configurable: true
+                  }});
+                }} catch (e) {{}}
+                try {{
+                  Object.defineProperty(window, 'devicePixelRatio', {{
+                    get: () => dpr, configurable: true
+                  }});
+                }} catch (e) {{}}
+                if (sw > 0 && sh > 0) {{
+                  try {{
+                    Object.defineProperty(screen, 'width', {{ get: () => sw, configurable: true }});
+                    Object.defineProperty(screen, 'height', {{ get: () => sh, configurable: true }});
+                    Object.defineProperty(screen, 'availWidth', {{ get: () => sw, configurable: true }});
+                    Object.defineProperty(screen, 'availHeight', {{
+                      get: () => Math.max(600, sh - 40), configurable: true
+                    }});
+                    Object.defineProperty(screen, 'colorDepth', {{ get: () => 24, configurable: true }});
+                    Object.defineProperty(screen, 'pixelDepth', {{ get: () => 24, configurable: true }});
+                  }} catch (e) {{}}
+                }}
+                // WebGL UNMASKED_* 双保险（Camoufox 已注入时此段为 no-op 失败也无妨）
+                if (glVendor && glRenderer) {{
+                  try {{
+                    const patch = (proto) => {{
+                      if (!proto || !proto.getParameter) return;
+                      const raw = proto.getParameter;
+                      proto.getParameter = function(p) {{
+                        const dbg = this.getExtension && this.getExtension('WEBGL_debug_renderer_info');
+                        if (dbg) {{
+                          if (p === dbg.UNMASKED_VENDOR_WEBGL) return glVendor;
+                          if (p === dbg.UNMASKED_RENDERER_WEBGL) return glRenderer;
+                        }}
+                        return raw.apply(this, arguments);
+                      }};
+                    }};
+                    if (window.WebGLRenderingContext) patch(WebGLRenderingContext.prototype);
+                    if (window.WebGL2RenderingContext) patch(WebGL2RenderingContext.prototype);
+                  }} catch (e) {{}}
+                }}
+              }} catch (e) {{}}
+            }})();"""
+        )
+    except Exception:
+        pass
+
+
+def locale_language_pack(locale: Optional[str] = None) -> dict[str, Any]:
+    """
+    语言跟随地区 locale：
+      - locale: BCP47 主语言（en-US / ja-JP …）
+      - lang: 短码（en / ja）→ --lang / document
+      - languages: navigator.languages 风格列表
+      - accept_language: HTTP Accept-Language（q 值链）
+    """
+    loc = (locale or "en-US").strip().replace("_", "-") or "en-US"
+    # 规范化大小写：en-us → en-US
+    parts = loc.split("-")
+    if len(parts) >= 2:
+        loc = parts[0].lower() + "-" + parts[1].upper()
+        if len(parts) > 2:
+            loc = loc + "-" + "-".join(parts[2:])
+    else:
+        loc = parts[0].lower()
+    lang = loc.split("-", 1)[0].lower() or "en"
+
+    # 常见地区语言链（主语言 + 英语兜底，贴近真浏览器）
+    chains: dict[str, list[str]] = {
+        "en-US": ["en-US", "en"],
+        "en-GB": ["en-GB", "en"],
+        "en-AU": ["en-AU", "en-GB", "en"],
+        "en-CA": ["en-CA", "en-US", "en"],
+        "en-IE": ["en-IE", "en-GB", "en"],
+        "en-NZ": ["en-NZ", "en-GB", "en"],
+        "en-SG": ["en-SG", "en-GB", "en"],
+        "en-MY": ["en-MY", "en-GB", "en"],
+        "en-IN": ["en-IN", "en-GB", "en"],
+        "ja-JP": ["ja-JP", "ja", "en-US", "en"],
+        "ko-KR": ["ko-KR", "ko", "en-US", "en"],
+        "zh-TW": ["zh-TW", "zh-Hant", "zh", "en-US", "en"],
+        "zh-HK": ["zh-HK", "zh-Hant", "zh", "en-US", "en"],
+        "zh-CN": ["zh-CN", "zh", "en-US", "en"],
+        "de-DE": ["de-DE", "de", "en-US", "en"],
+        "de-CH": ["de-CH", "de", "en-US", "en"],
+        "fr-FR": ["fr-FR", "fr", "en-US", "en"],
+        "nl-NL": ["nl-NL", "nl", "en-US", "en"],
+        "es-ES": ["es-ES", "es", "en-US", "en"],
+        "es-MX": ["es-MX", "es-ES", "es", "en-US", "en"],
+        "it-IT": ["it-IT", "it", "en-US", "en"],
+        "sv-SE": ["sv-SE", "sv", "en-US", "en"],
+        "pl-PL": ["pl-PL", "pl", "en-US", "en"],
+        "pt-BR": ["pt-BR", "pt", "en-US", "en"],
+        "pt-PT": ["pt-PT", "pt", "en-US", "en"],
+    }
+    languages = list(chains.get(loc) or [])
+    if not languages:
+        # 未知 locale：主 tag + 语言短码 + en
+        languages = [loc]
+        if lang and lang != loc.lower():
+            languages.append(lang)
+        if lang != "en":
+            languages.extend(["en-US", "en"])
+        else:
+            if "en" not in languages:
+                languages.append("en")
+
+    # Accept-Language：q 递减
+    al_parts: list[str] = []
+    for i, item in enumerate(languages):
+        if i == 0:
+            al_parts.append(item)
+        else:
+            q = max(0.3, round(1.0 - 0.1 * i, 1))
+            # 常见：第二项 0.9，其后 0.8…
+            if i == 1:
+                q = 0.9
+            elif i == 2:
+                q = 0.8
+            elif i == 3:
+                q = 0.7
+            else:
+                q = max(0.5, round(0.9 - 0.1 * (i - 1), 1))
+            al_parts.append(f"{item};q={q}")
+    accept_language = ",".join(al_parts)
+    return {
+        "locale": loc,
+        "lang": lang,
+        "languages": languages,
+        "accept_language": accept_language,
+    }
+
+
+def _context_locale_kwargs(
+    locale: str,
+    timezone_id: str,
+    vp: dict[str, int],
+    *,
+    accept_language: Optional[str] = None,
+) -> dict[str, Any]:
+    """Playwright/Camoufox new_context 公共参数：locale + 时区 + Accept-Language。"""
+    pack = locale_language_pack(locale)
+    al = (accept_language or pack["accept_language"]).strip()
+    kw: dict[str, Any] = {
+        "viewport": {"width": int(vp["width"]), "height": int(vp["height"])},
+        "locale": pack["locale"],
+        "timezone_id": timezone_id,
+        "extra_http_headers": {
+            "Accept-Language": al,
+        },
+    }
+    return kw
+
+
+def _apply_navigator_languages(page, languages: list[str], lang: str) -> None:
+    """补 navigator.language / languages，与 locale 一致（防只改 HTTP 头）。"""
+    try:
+        langs = [str(x) for x in (languages or []) if x]
+        if not langs:
+            return
+        primary = (lang or langs[0].split("-")[0] or "en").strip()
+        # add_init_script 不收额外参数，语言表直接嵌进脚本
+        langs_js = json.dumps(langs, ensure_ascii=False)
+        primary_js = json.dumps(primary, ensure_ascii=False)
+        page.add_init_script(
+            f"""(() => {{
+              try {{
+                const langs = {langs_js};
+                const primary = {primary_js} || (langs[0] || 'en-US');
+                Object.defineProperty(Navigator.prototype, 'language', {{
+                  get: () => primary,
+                  configurable: true,
+                }});
+                Object.defineProperty(Navigator.prototype, 'languages', {{
+                  get: () => Object.freeze(langs.slice()),
+                  configurable: true,
+                }});
+              }} catch (e) {{}}
+            }})();"""
+        )
+    except Exception:
+        pass
 
 
 def same_session_register(
@@ -1094,6 +1846,7 @@ def same_session_register(
     humanize: Optional[bool] = None,
     timing: Optional[str] = None,
     viewport: Optional[dict[str, int]] = None,
+    device_fp: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """
     同会话协议注册（页内 fetch，不走 page.request）。
@@ -1105,7 +1858,8 @@ def same_session_register(
     默认直连、不用代理。proxy 仅在显式传入时启用（可选）。
 
     一号一换旋钮（env 或参数）:
-      browser/fp_os/locale/timezone/humanize/timing/viewport
+      browser/fp_os/locale/timezone/humanize/timing/viewport/device_fp
+      device_fp: WebGL/屏幕/DPR/CPU/媒体/canvas 等（见 build_device_fingerprint）
     """
     def _log(msg: str) -> None:
         """只打一行：有外部 log 回调就只走回调，绝不双份 print。"""
@@ -1198,7 +1952,12 @@ def same_session_register(
     else:
         proxy_info = resolve_proxy()
 
-    locale = (locale or os.getenv("GROK_LOCALE") or "").strip() or "en-US"
+    locale_raw = (locale or os.getenv("GROK_LOCALE") or "").strip() or "en-US"
+    lang_pack = locale_language_pack(locale_raw)
+    locale = lang_pack["locale"]
+    accept_language = lang_pack["accept_language"]
+    nav_languages = list(lang_pack["languages"])
+    lang_short = lang_pack["lang"]
     timezone_id = (timezone_id or os.getenv("GROK_TIMEZONE") or "").strip() or "America/New_York"
     timing_cfg = _parse_timing_profile(timing)
     out_steps_ref: list[str] = []
@@ -1225,7 +1984,28 @@ def same_session_register(
     humanize_val = humanize if humanize is not None else _env_bool("GROK_SAME_SESSION_HUMANIZE", True)
     if humanize_val is None:
         humanize_val = True
-    vp = viewport or _rand_viewport()
+    # 设备指纹：外部可传完整 profile；缺字段时用 build_device_fingerprint 补齐
+    if device_fp and isinstance(device_fp, dict) and device_fp.get("webgl_renderer"):
+        dev_fp = dict(device_fp)
+        if viewport and viewport.get("width"):
+            dev_fp["viewport"] = dict(viewport)
+            if not dev_fp.get("window"):
+                dev_fp["window"] = dict(viewport)
+    else:
+        dev_fp = build_device_fingerprint(fp_os_val, viewport=viewport)
+        if device_fp and isinstance(device_fp, dict):
+            for k, v in device_fp.items():
+                if v is not None:
+                    dev_fp[k] = v
+    vp = dict(dev_fp.get("viewport") or viewport or _rand_viewport())
+    dev_fp["viewport"] = vp
+    if not dev_fp.get("window"):
+        dev_fp["window"] = dict(vp)
+    dev_fp["fp_os"] = (
+        "macos"
+        if str(fp_os_val).lower() in ("mac", "macos", "osx", "darwin")
+        else "windows"
+    )
 
     out: dict[str, Any] = {
         "ok": False,
@@ -1247,11 +2027,30 @@ def same_session_register(
         "display_mode": display_mode,
         "proxy_server": None,
         "locale": locale,
+        "lang": lang_short,
+        "languages": nav_languages,
+        "accept_language": accept_language,
         "timezone": timezone_id,
         "fp_os": fp_os_val,
         "humanize": bool(humanize_val),
         "timing": timing_cfg["name"],
         "viewport": vp,
+        "device_fp": {
+            k: dev_fp.get(k)
+            for k in (
+                "screen",
+                "device_pixel_ratio",
+                "hardware_concurrency",
+                "device_memory_gb",
+                "webgl_vendor",
+                "webgl_renderer",
+                "media_micros",
+                "media_speakers",
+                "media_webcams",
+                "color_depth",
+                "max_touch_points",
+            )
+        },
     }
     t0 = time.time()
 
@@ -1300,6 +2099,36 @@ def same_session_register(
             pw_proxy["username"] = proxy_info["username"]
             pw_proxy["password"] = proxy_info.get("password") or ""
 
+    # Firefox/Camoufox 不支持 SOCKS5 用户名密码 → 本机 HTTP 桥接上游 SOCKS5
+    # curl 探测能通、浏览器 goto 超时，就是这个坑。
+    if pw_proxy and proxy_info:
+        server_l = str(proxy_info.get("server") or pw_proxy.get("server") or "").lower()
+        need_bridge = server_l.startswith("socks5") and bool(
+            pw_proxy.get("username") or proxy_info.get("username")
+        )
+        if need_bridge:
+            try:
+                from g.socks5_http_bridge import ensure_socks5_http_bridge
+
+                bridge_src = (
+                    proxy_info.get("server_url")
+                    or proxy
+                    or proxy_info.get("server")
+                    or ""
+                )
+                bridged = ensure_socks5_http_bridge(str(bridge_src))
+                if bridged and bridged.get("server"):
+                    _log(
+                        f"SOCKS5鉴权→本机桥 {bridged['server']} "
+                        f"(Firefox 不支持 socks5 auth)"
+                    )
+                    out["steps"].append(f"proxy_bridge:{bridged['server']}")
+                    out["proxy_bridge"] = bridged["server"]
+                    pw_proxy = {"server": bridged["server"]}
+            except Exception as be:
+                out["error"] = f"SOCKS5 本机桥失败: {be}"
+                return out
+
     castle = ""
     ctx = None
     camoufox_cm = None
@@ -1322,15 +2151,29 @@ def same_session_register(
                     pw_proxy=pw_proxy,
                     timezone_id=timezone_id,
                     log_fn=_log,
+                    accept_language=accept_language,
+                    languages=nav_languages,
+                    device_fp=dev_fp,
                 )
             except Exception as e:
                 out["error"] = f"camoufox 启动失败: {e}"
                 return out
             out["browser_from_pool"] = bool(from_pool)
             out["browser_launch_s"] = launch_s
+            out["viewport"] = vp
             out["steps"].append(
                 f"engine:camoufox-headless:os={fp_os_val}:hum={int(bool(humanize_val))}"
-                f":pool={int(bool(from_pool))}:launch={launch_s}s"
+                f":lang={locale}:pool={int(bool(from_pool))}:launch={launch_s}s"
+            )
+            out["steps"].append(f"accept_language:{accept_language[:48]}")
+            _gpu = str(dev_fp.get("webgl_renderer") or "")[:40]
+            out["steps"].append(
+                f"device:screen={((dev_fp.get('screen') or {}).get('width'))}x"
+                f"{((dev_fp.get('screen') or {}).get('height'))}"
+                f":dpr={dev_fp.get('device_pixel_ratio')}"
+                f":hw={dev_fp.get('hardware_concurrency')}"
+                f":mem={dev_fp.get('device_memory_gb')}"
+                f":gpu={_gpu}"
             )
         else:
             try:
@@ -1338,7 +2181,9 @@ def same_session_register(
             except Exception as e:
                 out["error"] = f"playwright 不可用: {e}"
                 return out
-            _log(f"启动 chrome · {display_mode}")
+            _log(
+                f"启动 chrome · {display_mode} · {locale} · al={accept_language[:36]}"
+            )
             p = sync_playwright().start()
             out["_pw"] = p
             chrome_args = [
@@ -1347,7 +2192,9 @@ def same_session_register(
                 "--no-default-browser-check",
                 "--disable-dev-shm-usage",
                 f"--window-size={int(vp['width'])},{int(vp['height'])}",
+                # --lang 用短码更稳（ja / de / en-US 均可；优先 BCP47）
                 f"--lang={locale}",
+                f"--accept-lang={accept_language}",
             ]
             if display_mode == "headless":
                 chrome_args.append("--headless=new")
@@ -1360,14 +2207,15 @@ def same_session_register(
                     ]
                 )
 
+            ctx_kw = _context_locale_kwargs(
+                locale, timezone_id, vp, accept_language=accept_language
+            )
             launch_kwargs: dict[str, Any] = {
                 "user_data_dir": str(profile_dir),
                 "channel": "chrome",
                 "headless": use_headless and display_mode == "headless",
-                "viewport": {"width": int(vp["width"]), "height": int(vp["height"])},
-                "locale": locale,
-                "timezone_id": timezone_id,
                 "args": chrome_args,
+                **ctx_kw,
             }
             if pw_proxy:
                 launch_kwargs["proxy"] = pw_proxy
@@ -1375,10 +2223,12 @@ def same_session_register(
             ctx = p.chromium.launch_persistent_context(**launch_kwargs)
             _log(f"chrome 就绪 · {time.time()-t_launch:.1f}s")
             out["steps"].append(f"engine:chrome-{display_mode}")
+            out["steps"].append(f"accept_language:{accept_language[:48]}")
 
         try:
             if browser_engine != "camoufox":
                 page = ctx.pages[0] if ctx.pages else ctx.new_page()
+                _apply_navigator_languages(page, nav_languages, lang_short)
             page.add_init_script(
                 "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
             )
@@ -1653,12 +2503,14 @@ def same_session_register(
             )
 
             # 公共头：与页内 connect-es 一致（referer 用当前页 URL）
+            # Accept-Language 跟随指纹区 locale，禁止写死 en-US
             page_url = page.url or f"{SITE}/sign-up"
             grpc_headers = {
                 "content-type": "application/grpc-web+proto",
                 "x-grpc-web": "1",
                 "x-user-agent": "connect-es/2.1.1",
                 "accept": "*/*",
+                "accept-language": accept_language,
             }
 
             # Turnstile 并行预解：与发码/收码/验码重叠（本地 solver 通常 15–20s）
@@ -1818,6 +2670,7 @@ def same_session_register(
                 "content-type": "text/plain;charset=UTF-8",
                 "next-router-state-tree": cfg["state_tree"],
                 "next-action": cfg["action_id"],
+                "accept-language": accept_language,
             }
             payload = json.dumps([body], ensure_ascii=False)
 
@@ -2002,6 +2855,31 @@ def same_session_register(
             # 链：grokipedia → grokusercontent → grok.com → auth.x.ai → accounts
             # 独立 curl 无注册会话 cookie → 400/auth-error，废的
 
+            def _page_alive() -> bool:
+                """浏览器/页已关时禁止再 goto/wait，避免 TargetClosedError 冒泡成整号异常。"""
+                try:
+                    if page is None or page.is_closed():
+                        return False
+                except Exception:
+                    return False
+                try:
+                    if ctx is not None and getattr(ctx, "browser", None) is not None:
+                        br = ctx.browser
+                        if br is not None and not br.is_connected():
+                            return False
+                except Exception:
+                    pass
+                return True
+
+            def _safe_page_wait(ms: int = 200) -> None:
+                if _page_alive():
+                    try:
+                        page.wait_for_timeout(ms)
+                        return
+                    except Exception:
+                        pass
+                time.sleep(max(0.05, (ms or 200) / 1000.0))
+
             def _follow_set_cookie(urls: list[str], tag: str = "set_cookie") -> tuple[str, str]:
                 """
                 最短路径（已验证有效）：
@@ -2009,6 +2887,7 @@ def same_session_register(
                 2) context.request.get（与 Chrome 同 cookie 罐，自动跟 302）
                 3) 失败再 page.goto 一次入口
                 禁止：独立 curl、禁止手动 5 站 hop
+                浏览器已关：只读 jar，不再 goto/evaluate（修 TargetClosedError）
                 """
                 if not urls:
                     return "", ""
@@ -2028,14 +2907,24 @@ def same_session_register(
 
                 # --- 主路径：context.request 共享 cookie 罐 ---
                 req_status: Any = None
+                closed_mid = False
                 try:
                     # 超时收紧：有 sso 时通常几秒内落 jar
                     resp = ctx.request.get(entry, timeout=25000, max_redirects=15)
                     req_status = resp.status
                     out["steps"].append(f"{tag}:req:{resp.status}")
                 except Exception as e:
-                    out["steps"].append(f"{tag}:req_err:{type(e).__name__}")
-                    req_status = f"err:{type(e).__name__}"
+                    en = type(e).__name__
+                    out["steps"].append(f"{tag}:req_err:{en}")
+                    req_status = f"err:{en}"
+                    elow = str(e).lower()
+                    if (
+                        "targetclosed" in en.lower()
+                        or "has been closed" in elow
+                        or "target page" in elow
+                        or "browser has been closed" in elow
+                    ):
+                        closed_mid = True
 
                 s1, s2 = _read_sso_jar()
                 if s1:
@@ -2047,15 +2936,28 @@ def same_session_register(
 
                 # request 后短轮询（约 1.2s），常比立刻 page.goto 更稳更快
                 for _ in range(6):
-                    try:
-                        page.wait_for_timeout(200)
-                    except Exception:
-                        time.sleep(0.2)
+                    _safe_page_wait(200)
                     s1, s2 = _read_sso_jar()
                     if s1:
                         out["steps"].append(f"{tag}:jar_poll_ok")
                         _log(f"cookie 链完成 · 短轮询 · {short_hosts}")
                         return s1, s2 or s1
+
+                # 浏览器已关：禁止 page.goto，避免二次 TargetClosed 炸整号
+                if closed_mid or not _page_alive():
+                    out["steps"].append(f"{tag}:browser_closed")
+                    _log(
+                        f"cookie 链未落 jar · {short_hosts} · http={req_status}"
+                        f" · 浏览器已关，跳过 page.goto"
+                    )
+                    try:
+                        out["cookie_names"] = [
+                            f"{c.get('name')}@{c.get('domain')}"
+                            for c in (ctx.cookies() or [])
+                        ][:40]
+                    except Exception:
+                        pass
+                    return "", ""
 
                 _log(f"cookie 链未落 jar · {short_hosts} · http={req_status}，改 page.goto")
 
@@ -2066,16 +2968,17 @@ def same_session_register(
                 except Exception as e:
                     out["steps"].append(f"{tag}:goto_err:{type(e).__name__}")
                     _log(f"page.goto 跟链失败 · {_compact_log(e, 80)}")
-                    # 最后：location 赋值
-                    try:
-                        page.evaluate(
-                            """(u) => { window.location.href = u; return true; }""",
-                            entry,
-                        )
-                        page.wait_for_load_state("domcontentloaded", timeout=30000)
-                        out["steps"].append(f"{tag}:location")
-                    except Exception as e2:
-                        out["steps"].append(f"{tag}:loc_err:{type(e2).__name__}")
+                    # 最后：location 赋值（页仍活才试）
+                    if _page_alive():
+                        try:
+                            page.evaluate(
+                                """(u) => { window.location.href = u; return true; }""",
+                                entry,
+                            )
+                            page.wait_for_load_state("domcontentloaded", timeout=30000)
+                            out["steps"].append(f"{tag}:location")
+                        except Exception as e2:
+                            out["steps"].append(f"{tag}:loc_err:{type(e2).__name__}")
 
                 # 最多约 2.4s 轮询 jar
                 for _ in range(8):
@@ -2084,10 +2987,7 @@ def same_session_register(
                         out["steps"].append(f"{tag}:jar_ok")
                         _log(f"cookie 链完成 · page.goto · {short_hosts}")
                         return s1, s2 or s1
-                    try:
-                        page.wait_for_timeout(300)
-                    except Exception:
-                        time.sleep(0.3)
+                    _safe_page_wait(300)
 
                 try:
                     out["cookie_names"] = [
@@ -2115,17 +3015,26 @@ def same_session_register(
                     return out
 
             if not sso:
-                # 再短等 jar（约 1.5s）
+                # 再短等 jar（约 1.5s）；页已关用 sleep，禁止 wait_for_timeout 抛 TargetClosed
                 for _ in range(5):
                     sso, sso_rw = _read_sso_jar()
                     if sso:
                         break
-                    page.wait_for_timeout(300)
+                    try:
+                        if page is not None and not page.is_closed():
+                            page.wait_for_timeout(300)
+                        else:
+                            time.sleep(0.3)
+                    except Exception:
+                        time.sleep(0.3)
 
             if not sso:
+                _st = out.get("signup_status")
+                if _st is None and isinstance(r3, dict):
+                    _st = r3.get("status")
                 out["error"] = (
                     f"no sso after set-cookie follow "
-                    f"status={r3['status']} set_urls={len(set_urls)} "
+                    f"status={_st} set_urls={len(set_urls)} "
                     f"url0_len={out.get('set_cookie_url0_len')} "
                     f"cookies={out.get('cookie_names')}"
                 )
@@ -2150,12 +3059,18 @@ def same_session_register(
                     camoufox_cm.__exit__(None, None, None)
                 except Exception:
                     pass
+                # 整机关闭后才 force 清 loop
+                _clear_thread_event_loop(force=True)
+            # 池路径：browser/Playwright loop 仍存活，禁止 force 清。
+            # 之前这里 force 清会把 thread-local _running_loop 摘掉，
+            # 下号冷启/复用时回调炸：ProactorEventLoop is not the running loop。
             pw = out.pop("_pw", None)
             if pw is not None:
                 try:
                     pw.stop()
                 except Exception:
                     pass
+                _clear_thread_event_loop(force=True)
     except Exception as e:
         out["error"] = f"same_session 异常: {e}"
         out["steps"].append(f"exc:{e}")
@@ -2165,17 +3080,21 @@ def same_session_register(
                 ctx.close()
         except Exception:
             pass
+        # 异常时若还握着 camoufox_cm：关掉并 force 清；
+        # 若已入池（from_pool / cm 已移交），不要 force 清 running loop
         if camoufox_cm is not None and not from_pool:
             try:
                 camoufox_cm.__exit__(None, None, None)
             except Exception:
                 pass
+            _clear_thread_event_loop(force=True)
         pw = out.pop("_pw", None)
         if pw is not None:
             try:
                 pw.stop()
             except Exception:
                 pass
+            _clear_thread_event_loop(force=True)
     finally:
         out["elapsed_s"] = round(time.time() - t0, 2)
         # 恢复业务代理环境（多账号循环下一号还要读 GROK_PROXY）

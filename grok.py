@@ -98,188 +98,298 @@ def resolve_register_mode(raw: Optional[str] = None) -> str:
 
 
 # same_session 指纹地区（locale/timezone；代理默认本机）
-# 多区 + 双 OS，配合 camoufox 池限次/多槽，避免同一指纹出口连号
+# 多区 + 双 OS，配合 camoufox 池限次/冷启，压 Castle $registration 连号 deny
 _SS_FP_REGIONS = [
-    {
-        "tag": "US-W",
-        "locale": "en-US",
-        "timezone": "America/Los_Angeles",
-        "fp_os": "windows",
-    },
-    {
-        "tag": "US-E",
-        "locale": "en-US",
-        "timezone": "America/New_York",
-        "fp_os": "windows",
-    },
-    {
-        "tag": "US-C",
-        "locale": "en-US",
-        "timezone": "America/Chicago",
-        "fp_os": "macos",
-    },
-    {
-        "tag": "AU",
-        "locale": "en-AU",
-        "timezone": "Australia/Sydney",
-        "fp_os": "windows",
-    },
-    {
-        "tag": "AU-MEL",
-        "locale": "en-AU",
-        "timezone": "Australia/Melbourne",
-        "fp_os": "macos",
-    },
-    {
-        "tag": "JP",
-        "locale": "ja-JP",
-        "timezone": "Asia/Tokyo",
-        "fp_os": "windows",
-    },
-    {
-        "tag": "GB",
-        "locale": "en-GB",
-        "timezone": "Europe/London",
-        "fp_os": "windows",
-    },
-    {
-        "tag": "CA",
-        "locale": "en-CA",
-        "timezone": "America/Toronto",
-        "fp_os": "macos",
-    },
-    {
-        "tag": "DE",
-        "locale": "de-DE",
-        "timezone": "Europe/Berlin",
-        "fp_os": "windows",
-    },
-    {
-        "tag": "SG",
-        "locale": "en-SG",
-        "timezone": "Asia/Singapore",
-        "fp_os": "windows",
-    },
+    {"tag": "US-W", "locale": "en-US", "timezone": "America/Los_Angeles", "fp_os": "windows"},
+    {"tag": "US-E", "locale": "en-US", "timezone": "America/New_York", "fp_os": "windows"},
+    {"tag": "US-C", "locale": "en-US", "timezone": "America/Chicago", "fp_os": "macos"},
+    {"tag": "US-DEN", "locale": "en-US", "timezone": "America/Denver", "fp_os": "windows"},
+    {"tag": "US-PHX", "locale": "en-US", "timezone": "America/Phoenix", "fp_os": "macos"},
+    {"tag": "US-SEA", "locale": "en-US", "timezone": "America/Los_Angeles", "fp_os": "macos"},
+    {"tag": "CA", "locale": "en-CA", "timezone": "America/Toronto", "fp_os": "macos"},
+    {"tag": "CA-W", "locale": "en-CA", "timezone": "America/Vancouver", "fp_os": "windows"},
+    {"tag": "GB", "locale": "en-GB", "timezone": "Europe/London", "fp_os": "windows"},
+    {"tag": "IE", "locale": "en-IE", "timezone": "Europe/Dublin", "fp_os": "macos"},
+    {"tag": "DE", "locale": "de-DE", "timezone": "Europe/Berlin", "fp_os": "windows"},
+    {"tag": "DE-MUC", "locale": "de-DE", "timezone": "Europe/Berlin", "fp_os": "macos"},
+    {"tag": "FR", "locale": "fr-FR", "timezone": "Europe/Paris", "fp_os": "windows"},
+    {"tag": "NL", "locale": "nl-NL", "timezone": "Europe/Amsterdam", "fp_os": "macos"},
+    {"tag": "ES", "locale": "es-ES", "timezone": "Europe/Madrid", "fp_os": "windows"},
+    {"tag": "IT", "locale": "it-IT", "timezone": "Europe/Rome", "fp_os": "macos"},
+    {"tag": "SE", "locale": "sv-SE", "timezone": "Europe/Stockholm", "fp_os": "windows"},
+    {"tag": "PL", "locale": "pl-PL", "timezone": "Europe/Warsaw", "fp_os": "windows"},
+    {"tag": "CH", "locale": "de-CH", "timezone": "Europe/Zurich", "fp_os": "macos"},
+    {"tag": "JP", "locale": "ja-JP", "timezone": "Asia/Tokyo", "fp_os": "windows"},
+    {"tag": "JP-OSK", "locale": "ja-JP", "timezone": "Asia/Tokyo", "fp_os": "macos"},
+    {"tag": "KR", "locale": "ko-KR", "timezone": "Asia/Seoul", "fp_os": "windows"},
+    {"tag": "TW", "locale": "zh-TW", "timezone": "Asia/Taipei", "fp_os": "macos"},
+    {"tag": "HK", "locale": "zh-HK", "timezone": "Asia/Hong_Kong", "fp_os": "windows"},
+    {"tag": "SG", "locale": "en-SG", "timezone": "Asia/Singapore", "fp_os": "windows"},
+    {"tag": "SG-M", "locale": "en-SG", "timezone": "Asia/Singapore", "fp_os": "macos"},
+    {"tag": "MY", "locale": "en-MY", "timezone": "Asia/Kuala_Lumpur", "fp_os": "windows"},
+    {"tag": "IN", "locale": "en-IN", "timezone": "Asia/Kolkata", "fp_os": "windows"},
+    {"tag": "AU", "locale": "en-AU", "timezone": "Australia/Sydney", "fp_os": "windows"},
+    {"tag": "AU-MEL", "locale": "en-AU", "timezone": "Australia/Melbourne", "fp_os": "macos"},
+    {"tag": "AU-PER", "locale": "en-AU", "timezone": "Australia/Perth", "fp_os": "windows"},
+    {"tag": "NZ", "locale": "en-NZ", "timezone": "Pacific/Auckland", "fp_os": "macos"},
+    {"tag": "BR", "locale": "pt-BR", "timezone": "America/Sao_Paulo", "fp_os": "windows"},
+    {"tag": "MX", "locale": "es-MX", "timezone": "America/Mexico_City", "fp_os": "macos"},
 ]
 _SS_FP_OS_POOL = ("windows", "macos")
 _SS_VIEWPORT_BASES = (
+    (1280, 720),
+    (1280, 800),
+    (1360, 768),
     (1366, 768),
+    (1400, 900),
     (1440, 900),
+    (1470, 956),
+    (1512, 982),  # mac-ish
     (1536, 864),
     (1600, 900),
     (1680, 1050),
+    (1728, 1117),
+    (1792, 1120),
     (1920, 1080),
-    (1280, 800),
-    (1512, 982),  # mac-ish
+    (1920, 1200),
+    (2048, 1152),
+    (2560, 1440),
 )
+# 近期指纹签名去重：避免同批连号撞同一 locale/OS/时区簇
+_SS_RECENT_FP_LOCK = threading.Lock()
+_SS_RECENT_FP_SIGS: deque = deque(maxlen=48)
 
 
 def _ss_local_proxy_spec() -> str:
-    """
-    same_session 代理：
-      GROK_PROXY / XAI_PROXY / SAME_SESSION_PROXY / GROK_SAME_SESSION_PROXY
-      / STANDALONE_LOCAL_PROXY / LOCAL_PROXY
-    全空 = 直连（不再默认写死 7897）。
-    """
-    for key in (
-        "GROK_PROXY",
-        "XAI_PROXY",
-        "SAME_SESSION_PROXY",
-        "GROK_SAME_SESSION_PROXY",
-        "STANDALONE_LOCAL_PROXY",
-        "LOCAL_PROXY",
-    ):
-        raw = (os.environ.get(key) or "").strip()
-        if raw:
-            return raw
-    return ""
+    """同会话默认本机代理：STANDALONE_LOCAL_PROXY / LOCAL_PROXY / 127.0.0.1:7897。"""
+    raw = (
+        os.environ.get("STANDALONE_LOCAL_PROXY")
+        or os.environ.get("LOCAL_PROXY")
+        or os.environ.get("GROK_SAME_SESSION_PROXY")
+        or "127.0.0.1:7897"
+    ).strip()
+    if not raw:
+        return "127.0.0.1:7897"
+    return raw
+
+
+def _ss_fp_sig(fp: dict[str, Any]) -> str:
+    """粗粒度签名：区 + OS + 时区 + 时序档（分辨率故意不进，避免过严）。"""
+    return "|".join(
+        [
+            str(fp.get("tag") or ""),
+            str(fp.get("fp_os") or ""),
+            str(fp.get("timezone") or ""),
+            str(fp.get("locale") or ""),
+            str(fp.get("timing") or ""),
+        ]
+    )
 
 
 def _ss_pick_fp(idx: int = 0) -> dict[str, Any]:
     """
-    打散指纹：地区/时区/OS/分辨率/时序尽量轮转+抖动，
-    避免同 worker 连号撞同一 camoufox 出口画像。
+    打散指纹：地区/时区/OS/分辨率/时序轮转+抖动+近期去重，
+    压同 worker 连号撞同一 camoufox 出口画像（Castle $registration deny 簇）。
     """
     n = len(_SS_FP_REGIONS)
-    if idx and n:
-        # 主序轮转 + 邻域随机，避免严格周期被识别
-        base = (max(0, int(idx) - 1) * 3 + random.randint(0, 2)) % n
-        # 30% 完全随机跳区
-        if random.random() < 0.30:
-            region = random.choice(_SS_FP_REGIONS)
-        else:
-            region = _SS_FP_REGIONS[base]
-    else:
-        region = random.choice(_SS_FP_REGIONS)
+    jump_p = 0.55  # 默认更爱跳区
+    try:
+        jump_p = float(
+            (
+                os.environ.get("GROK_SS_FP_JUMP_PROB")
+                or os.environ.get("STANDALONE_FP_JUMP")
+                or "0.55"
+            ).strip()
+            or "0.55"
+        )
+    except ValueError:
+        jump_p = 0.55
+    jump_p = max(0.15, min(0.95, jump_p))
+
+    def _one_region() -> dict[str, Any]:
+        if idx and n:
+            # 主序跨步更大（*5），邻域更宽，减少周期感
+            base = (max(0, int(idx) - 1) * 5 + random.randint(0, 4)) % n
+            if random.random() < jump_p:
+                return random.choice(_SS_FP_REGIONS)
+            return _SS_FP_REGIONS[base]
+        return random.choice(_SS_FP_REGIONS)
 
     timing_env = (
         os.environ.get("STANDALONE_TIMING")
         or os.environ.get("GROK_SS_TIMING")
         or "rotate"
     ).strip().lower()
-    if timing_env in ("rotate", "random", "rand", "mix", ""):
-        # 默认 rotate：turbo/fast 为主，偶发 normal
-        timing = random.choices(
-            ["turbo", "fast", "normal"], weights=[50, 35, 15], k=1
-        )[0]
-    elif timing_env in ("turbo", "fast", "normal", "human", "slow"):
-        # 固定档也掺一点抖动
-        if random.random() < 0.25:
-            timing = random.choice(["turbo", "fast", "normal"])
-        else:
-            timing = timing_env
-    else:
-        timing = random.choice(["turbo", "fast", "normal"])
+
+    def _one_timing() -> str:
+        if timing_env in ("rotate", "random", "rand", "mix", ""):
+            # 略抬 normal，压纯 turbo 连发
+            return random.choices(
+                ["turbo", "fast", "normal", "human"],
+                weights=[32, 38, 22, 8],
+                k=1,
+            )[0]
+        if timing_env in ("turbo", "fast", "normal", "human", "slow"):
+            if random.random() < 0.35:
+                return random.choice(["turbo", "fast", "normal", "human"])
+            return timing_env
+        return random.choice(["turbo", "fast", "normal"])
 
     os_env = (
         os.environ.get("STANDALONE_FP_OS") or os.environ.get("GROK_SS_FP_OS") or ""
     ).strip().lower()
-    if os_env in ("win", "windows"):
-        fp_os = "windows"
-    elif os_env in ("mac", "macos", "osx"):
-        fp_os = "macos"
-    elif os_env in ("rotate", "random", "mix", "auto", ""):
-        # 默认打散 OS：地区偏好 60% + 池内随机 40%
-        pref = str(region.get("fp_os") or "windows").strip().lower()
-        if pref not in _SS_FP_OS_POOL:
-            pref = "windows"
-        if random.random() < 0.40:
-            fp_os = random.choice(list(_SS_FP_OS_POOL))
-        else:
-            fp_os = pref
-    else:
-        fp_os = "windows"
 
-    vw, vh = random.choice(_SS_VIEWPORT_BASES)
-    # 分辨率再抖一截，避免整批同一 window
-    vw = max(1200, vw + random.randint(-24, 24))
-    vh = max(700, vh + random.randint(-18, 18))
+    def _one_os(region: dict[str, Any]) -> str:
+        if os_env in ("win", "windows"):
+            return "windows"
+        if os_env in ("mac", "macos", "osx"):
+            return "macos"
+        if os_env in ("rotate", "random", "mix", "auto", ""):
+            pref = str(region.get("fp_os") or "windows").strip().lower()
+            if pref not in _SS_FP_OS_POOL:
+                pref = "windows"
+            # 55% 池内随机，更打散 OS
+            if random.random() < 0.55:
+                return random.choice(list(_SS_FP_OS_POOL))
+            return pref
+        return "windows"
 
     hum_env = (
         os.environ.get("STANDALONE_HUMANIZE")
         or os.environ.get("GROK_SAME_SESSION_HUMANIZE")
         or ""
     ).strip().lower()
-    if hum_env in ("1", "true", "yes", "on"):
-        humanize = True
-    elif hum_env in ("0", "false", "no", "off"):
-        humanize = False
-    else:
-        # 默认：非 turbo 开一点 humanize；turbo 也 15% 概率开
-        if timing in ("turbo", "fast"):
-            humanize = random.random() < 0.15
-        else:
-            humanize = True
 
-    return {
-        "tag": region.get("tag") or "LOCAL",
-        "locale": region.get("locale") or "en-US",
-        "timezone": region.get("timezone") or "America/Los_Angeles",
-        "fp_os": fp_os,
-        "timing": timing,
-        "viewport": {"width": vw, "height": vh},
-        "humanize": humanize,
-    }
+    def _one_humanize(timing: str) -> bool:
+        if hum_env in ("1", "true", "yes", "on"):
+            return True
+        if hum_env in ("0", "false", "no", "off"):
+            return False
+        if timing in ("turbo", "fast"):
+            return random.random() < 0.28
+        if timing == "human":
+            return True
+        return random.random() < 0.75
+
+    #  ass 最多 8 次：撞近期签名就换区/OS/时序
+    fp: dict[str, Any] = {}
+    for _try in range(8):
+        region = _one_region()
+        timing = _one_timing()
+        fp_os = _one_os(region)
+        vw, vh = random.choice(_SS_VIEWPORT_BASES)
+        # 分辨率再抖一截
+        vw = max(1180, min(2560, vw + random.randint(-36, 40)))
+        vh = max(700, min(1600, vh + random.randint(-28, 32)))
+        # 偶发非 16:9 常见比，再打散
+        if random.random() < 0.12:
+            vw = max(1200, vw + random.randint(-80, 120))
+            vh = max(720, int(vw * random.uniform(0.55, 0.72)))
+        cand = {
+            "tag": region.get("tag") or "LOCAL",
+            "locale": region.get("locale") or "en-US",
+            "timezone": region.get("timezone") or "America/Los_Angeles",
+            "fp_os": fp_os,
+            "timing": timing,
+            "viewport": {"width": int(vw), "height": int(vh)},
+            "humanize": _one_humanize(timing),
+        }
+        sig = _ss_fp_sig(cand)
+        with _SS_RECENT_FP_LOCK:
+            recent = set(_SS_RECENT_FP_SIGS)
+            # 同 tag+os+tz 在近 12 条里出现过 → 重抽
+            coarse = f"{cand['tag']}|{cand['fp_os']}|{cand['timezone']}"
+            coarse_hit = any(
+                s.startswith(coarse + "|") or s.startswith(coarse)
+                for s in list(_SS_RECENT_FP_SIGS)[-16:]
+            )
+            if sig in recent or coarse_hit:
+                continue
+            _SS_RECENT_FP_SIGS.append(sig)
+            fp = cand
+            break
+    if not fp:
+        # 兜底：强制随机区 + 记签名
+        region = random.choice(_SS_FP_REGIONS)
+        timing = _one_timing()
+        vw, vh = random.choice(_SS_VIEWPORT_BASES)
+        vw = max(1200, vw + random.randint(-20, 20))
+        vh = max(700, vh + random.randint(-16, 16))
+        fp = {
+            "tag": region.get("tag") or "LOCAL",
+            "locale": region.get("locale") or "en-US",
+            "timezone": region.get("timezone") or "America/Los_Angeles",
+            "fp_os": _one_os(region),
+            "timing": timing,
+            "viewport": {"width": int(vw), "height": int(vh)},
+            "humanize": _one_humanize(timing),
+        }
+        with _SS_RECENT_FP_LOCK:
+            _SS_RECENT_FP_SIGS.append(_ss_fp_sig(fp))
+    return fp
+
+
+def _ss_deny_break_n() -> int:
+    """
+    连续 risk MARKED/deny 熔断阈值（对齐 standalone）。
+    默认 3：同出口 Castle deny 簇打开后继续硬刚只会空烧。
+    覆盖：GROK_SS_DENY_BREAK / STANDALONE_DENY_BREAK；0/off 关闭。
+    """
+    raw = (
+        os.environ.get("GROK_SS_DENY_BREAK")
+        or os.environ.get("STANDALONE_DENY_BREAK")
+        or "3"
+    ).strip().lower()
+    if raw in ("0", "off", "false", "no", "none"):
+        return 0
+    try:
+        return max(0, int(raw))
+    except Exception:
+        return 3
+
+
+def _ss_inter_account_delay(workers: int = 1, consecutive_deny: int = 0) -> float:
+    """
+    号间抖动秒数：压同出口短时 $registration 密度。
+    GROK_SS_JITTER_MS=800-2800 或 单值；0 关闭。
+    连续 MARKED 时指数加冷（对齐 standalone）。
+    """
+    raw = (
+        os.environ.get("GROK_SS_JITTER_MS")
+        or os.environ.get("STANDALONE_SS_JITTER_MS")
+        or "900-3200"
+    ).strip().lower()
+    if raw in ("0", "off", "no", "false", "none", ""):
+        # 空默认仍给一点底噪
+        if raw == "":
+            lo, hi = 900, 3200
+        else:
+            base = 0.0
+            if consecutive_deny > 0:
+                base += min(20.0, 4.0 * (2 ** (max(0, consecutive_deny) - 1)))
+            return max(0.0, base)
+    else:
+        try:
+            if "-" in raw:
+                a, b = raw.split("-", 1)
+                lo, hi = int(a.strip()), int(b.strip())
+            else:
+                lo = hi = int(raw)
+        except ValueError:
+            lo, hi = 900, 3200
+    if hi < lo:
+        lo, hi = hi, lo
+    lo = max(0, lo)
+    hi = max(lo, hi)
+    # 并发越高，单号再多等一点，摊平出口
+    w = max(1, int(workers or 1))
+    bump = min(1800, 180 * max(0, w - 1))
+    ms = random.randint(lo, hi + bump)
+    base = ms / 1000.0
+    # 连续 deny：指数加冷（1→+4s, 2→+8s, 3→+16s… 封顶 +20s）
+    if consecutive_deny > 0:
+        base += min(20.0, 4.0 * (2 ** (max(0, int(consecutive_deny)) - 1)))
+    return max(0.0, base)
 
 
 def get_random_chrome_profile():
@@ -1204,6 +1314,12 @@ class RegisterEngine:
         self.fail_count = 0
         self.clean_count = 0
         self.marked_count = 0
+        # 创邮尝试次数：数量 N = 创建 N 个邮箱就停（CLEAN/MARKED/失败都计 1 次）
+        self.attempt_count = 0
+        self._ss_attempt_lock = threading.Lock()
+        # 连续 risk MARKED（跨线程）：触顶熔断，避免同出口 deny 簇空烧
+        self._ss_consecutive_deny = 0
+        self._ss_deny_lock = threading.Lock()
         self.target_count = 0
         self.workers = 0
         self.start_time: Optional[float] = None
@@ -1260,14 +1376,18 @@ class RegisterEngine:
             if self.success_count > 0:
                 avg = elapsed / self.success_count
         progress = 0.0
+        attempts = int(getattr(self, "attempt_count", 0) or 0)
         if self.target_count > 0:
-            progress = min(100.0, self.success_count / self.target_count * 100)
+            # 进度条 = CLEAN 成功 / 目标（创邮次数另字段 attempt_count，别拿来当完成度）
+            # 否则数量=1 时一建邮就 100%，验码/signup 还在跑也显示满格
+            progress = min(100.0, float(self.success_count) / self.target_count * 100)
         return {
             "status": self.status,
             "success_count": self.success_count,
             "fail_count": self.fail_count,
             "clean_count": int(getattr(self, "clean_count", 0) or 0),
             "marked_count": int(getattr(self, "marked_count", 0) or 0),
+            "attempt_count": attempts,
             "target_count": self.target_count,
             "workers": self.workers,
             "register_mode": getattr(self, "register_mode", None) or resolve_register_mode(),
@@ -1572,14 +1692,22 @@ class RegisterEngine:
         *,
         already_written: bool = False,
         auth_token: Optional[dict] = None,
-    ) -> bool:
+    ) -> str:
         """
-        写入 SSO 并计入成功。返回 True 表示已计入。
+        写入 SSO 并计入成功。返回 success_id（空串表示未计入成功列表）。
+        same_session：停批看创邮次数，CLEAN 数可超过 target（在飞号收尾仍计成功）。
+        protocol：仍按 CLEAN 数顶 target。
         already_written=True：SSO 已在紧急落盘写过，只更新计数/UI，避免重复行。
         auth_token：注册时 device flow 换到的 token，导入上游可直写，免二次换票。
         """
         with self.file_lock:
-            if self.success_count >= self.target_count:
+            mode_now = resolve_register_mode(getattr(self, "register_mode", None))
+            # same_session 以创邮次数停批；在飞号拿到 CLEAN 仍应进成功列表
+            # protocol 旧路径才用 success_count 顶 target
+            if (
+                mode_now != "same_session"
+                and self.success_count >= self.target_count
+            ):
                 if not self.stop_event.is_set():
                     self.stop_event.set()
                 # 已达目标但仍拿到 SSO：紧急保存，绝不丢号
@@ -1634,8 +1762,9 @@ class RegisterEngine:
                 }
             )
             extra = f" | {note}" if note else ""
+            attempts = int(getattr(self, "attempt_count", 0) or 0)
             self.log(
-                f"注册成功: {self.success_count}/{self.target_count} | {email} | "
+                f"CLEAN {self.success_count} · 创邮 {attempts}/{self.target_count} | {email} | "
                 f"SSO: {sso[:15]}... | 平均: {avg:.1f}s | NSFW: {nsfw_tag}{extra}",
                 "success",
             )
@@ -1644,10 +1773,16 @@ class RegisterEngine:
                     email_service.delete_email(email)
                 except Exception:
                     pass
-            if self.success_count >= self.target_count and not self.stop_event.is_set():
+            # same_session：停批看创邮次数，不在这里用 CLEAN 数提前停
+            # protocol 旧路径仍可按 CLEAN 凑满（attempt 未启用时）
+            if (
+                resolve_register_mode(getattr(self, "register_mode", None)) != "same_session"
+                and self.success_count >= self.target_count
+                and not self.stop_event.is_set()
+            ):
                 self.stop_event.set()
                 self.log(
-                    f"已达到目标数量: {self.success_count}/{self.target_count}，停止新注册",
+                    f"已达到 CLEAN 目标: {self.success_count}/{self.target_count}，停止新注册",
                     "success",
                 )
             return success_id
@@ -1924,13 +2059,16 @@ class RegisterEngine:
         impersonate: str = "chrome131",
         user_agent: str = "",
         retries: int = 3,
+        async_mode: bool = False,
     ) -> Optional[dict]:
         """
-        前台换 token：接在 risk 检测之后，作为正式流程一步。
-        成功则缓存到 recent_success，导入时优先直写，不再现换。
-        失败不改成功计数；导入侧仍可用 sso-to-oauth / 本机 device flow 兜底。
+        换 token（device flow 发票）。
+        默认由后台 enrich 池调用（async_mode=True），不堵注册主路径。
+        成功则缓存到 recent_success，导入时优先直写；失败不改成功计数，
+        导入侧仍可用 sso-to-oauth / 本机 device flow 兜底。
         """
-        self.log(f"{email} 换 token 开始…", "info")
+        tag = "[后台] " if async_mode else ""
+        self.log(f"{email} {tag}换 token 开始…", "info")
         t0 = time.time()
         try:
             check = validate_sso_cookie(
@@ -1953,48 +2091,48 @@ class RegisterEngine:
                     self._update_success_meta(
                         success_id,
                         auth_token=token,
-                        note=f"token=cached · device_flow=ok · {elapsed}s",
+                        note=f"token=cached · device_flow=ok · async={int(async_mode)} · {elapsed}s",
                     )
                     self.log(
-                        f"{email} 换 token 成功 · 已缓存 · {elapsed}s（导入可直写）",
+                        f"{email} {tag}换 token 成功 · 已缓存 · {elapsed}s（导入可直写）",
                         "success",
                     )
                     return token
                 self._update_success_meta(
                     success_id,
-                    note=f"token=unusable · {elapsed}s",
+                    note=f"token=unusable · async={int(async_mode)} · {elapsed}s",
                 )
                 self.log(
-                    f"{email} 换 token 返回体不可用 · {elapsed}s（导入走兜底）",
+                    f"{email} {tag}换 token 返回体不可用 · {elapsed}s（导入走兜底）",
                     "warn",
                 )
                 return None
             if check.get("ok") and check.get("approved") and not check.get("token"):
                 self._update_success_meta(
                     success_id,
-                    note=f"token=approved_no_body · {elapsed}s",
+                    note=f"token=approved_no_body · async={int(async_mode)} · {elapsed}s",
                 )
                 self.log(
-                    f"{email} 换 token：approve 成功但无 token 体 · {elapsed}s（导入兜底）",
+                    f"{email} {tag}换 token：approve 成功但无 token 体 · {elapsed}s（导入兜底）",
                     "warn",
                 )
                 return None
             err = check.get("error") or "device flow 失败"
             self._update_success_meta(
                 success_id,
-                note=f"token=fail · {str(err)[:60]} · {elapsed}s",
+                note=f"token=fail · {str(err)[:60]} · async={int(async_mode)} · {elapsed}s",
             )
             self.log(
-                f"{email} 换 token 失败 · {err} · {elapsed}s（导入走 sso-to-oauth/兜底）",
+                f"{email} {tag}换 token 失败 · {err} · {elapsed}s（导入走 sso-to-oauth/兜底）",
                 "warn",
             )
             return None
         except Exception as e:
             elapsed = round(time.time() - t0, 1)
-            self.log(f"{email} 换 token 异常 · {e} · {elapsed}s", "warn")
+            self.log(f"{email} {tag}换 token 异常 · {e} · {elapsed}s", "warn")
             self._update_success_meta(
                 success_id,
-                note=f"token=exc · {str(e)[:60]}",
+                note=f"token=exc · {str(e)[:60]} · async={int(async_mode)}",
             )
             return None
 
@@ -2010,10 +2148,10 @@ class RegisterEngine:
         skip_token: bool = False,
     ) -> None:
         """
-        SSO 后收尾：
-        - skip_token=True（默认 same_session 前台已换票）：只做协议/NSFW
-        - skip_token=False：兼容旧路径，后台先换 token 再 NSFW
-        失败不影响成功计数。导入换票仅兜底，主路径应已有缓存 token。
+        SSO 后后台收尾（enrich 池，不堵注册主路径）：
+        - skip_token=False（same_session 默认）：先异步换 token，再协议/NSFW
+        - skip_token=True：只做协议/NSFW（token 已在别处处理）
+        失败不影响成功计数；导入侧可对缺 token 号走兜底。
         """
         try:
             user_agreement_service = UserAgreementService()
@@ -2022,41 +2160,21 @@ class RegisterEngine:
             auth_token = None
 
             if not skip_token:
-                # 旧路径 / 未前台换票时：后台 device flow
-                check = validate_sso_cookie(
-                    sso,
-                    impersonate=impersonate,
-                    user_agent=user_agent,
-                    require_device_flow=True,
-                    retries=3,
-                    timeout=28,
-                    issue_token=True,
+                # 异步换 token：与下一号注册重叠
+                auth_token = self._exchange_token_after_clean(
+                    email=email,
+                    sso=sso,
+                    success_id=success_id,
+                    impersonate=impersonate or "chrome131",
+                    user_agent=user_agent or "",
+                    async_mode=True,
                 )
-                if check.get("ok") and isinstance(check.get("token"), dict):
-                    auth_token = check.get("token")
-                    note_parts.append("device_flow=ok+token_cached")
-                    self.log(
-                        f"{email} [后台] device flow 通过，token 已缓存",
-                        "success",
-                    )
-                elif check.get("ok") and check.get("approved") and not check.get("token"):
-                    note_parts.append("device_flow=approved_no_token")
-                    self.log(
-                        f"{email} [后台] approve 成功但未拿到 token，导入时兜底再换",
-                        "warn",
-                    )
-                elif check.get("ok"):
-                    note_parts.append("device_flow=ok")
-                    self.log(f"{email} [后台] device flow 通过（无 token 体）", "info")
+                if isinstance(auth_token, dict) and is_auth_token_usable(auth_token):
+                    note_parts.append("token=async_cached")
                 else:
-                    err = check.get("error") or "device flow 失败"
-                    note_parts.append(f"device_flow_pending: {str(err)[:60]}")
-                    self.log(
-                        f"{email} [后台] device flow 未通过（{err}），导入时兜底再换",
-                        "warn",
-                    )
+                    note_parts.append("token=async_pending_or_fail")
             else:
-                note_parts.append("token=foreground_done")
+                note_parts.append("token=skipped")
 
             unhinged_ok = False
             try:
@@ -2095,6 +2213,7 @@ class RegisterEngine:
                 self.log(f"{email} [后台] 协议/NSFW 异常: {post_err}", "warn")
 
             note = "; ".join(str(x)[:80] for x in note_parts)
+            # token 已在 _exchange_token_after_clean 里写过；这里再合并 note/nsfw
             self._update_success_meta(
                 success_id,
                 auth_token=auth_token if isinstance(auth_token, dict) else None,
@@ -2158,12 +2277,70 @@ class RegisterEngine:
         site_key = self.config.get("site_key") or "0x4AAAAAAAhr9JGVDZbrZOo0"
         proxy_spec_str = _ss_local_proxy_spec()
         current_email = None
+        # 数量 N = 创建 N 个邮箱就停（对齐 standalone COUNT）
+        # 不再「凑满 N 个 CLEAN 无限补」；失败/MARKED 也各占 1 次创邮额度
+        max_attempts = max(1, int(self.target_count or 1))
+        consecutive_browser_fails = 0
+        deny_break_n = _ss_deny_break_n()
+        self.log(
+            f"same_session · 数量={max_attempts}（按创邮次数停）"
+            f" · 连续MARKED熔断={deny_break_n or 'off'}"
+            f" · 代理={proxy_spec_str}",
+            "info",
+        )
 
-        while not self.stop_event.is_set() and self.success_count < self.target_count:
+        while not self.stop_event.is_set():
+            # 创邮次数到顶 → 整批结束（成功+失败+MARKED 合计）
+            with self._ss_attempt_lock:
+                done_n = int(self.attempt_count or 0)
+            if done_n >= max_attempts:
+                self.log(
+                    f"创邮已达数量 {done_n}/{max_attempts}"
+                    f" · CLEAN {self.success_count}"
+                    f" · MARKED {getattr(self, 'marked_count', 0)}"
+                    f" · 过程失败 {self.fail_count} · 停批",
+                    "info",
+                )
+                self.stop_event.set()
+                return
+            # 连续 MARKED 熔断：同出口 Castle deny 簇打开后别硬刚
+            with self._ss_deny_lock:
+                cur_deny = int(self._ss_consecutive_deny or 0)
+            if deny_break_n > 0 and cur_deny >= deny_break_n:
+                self.log(
+                    f"连续 MARKED/deny {cur_deny}/{deny_break_n} · 熔断停批"
+                    f"（同出口 registration 密度过高，换出口/冷却后再开）",
+                    "error",
+                )
+                self.stop_event.set()
+                return
             idx = self._next_ss_idx()
+            # 号间抖动：压同出口短时 registration 密度（Castle deny 簇）
+            # 连续 MARKED 时自动加长冷却
+            jitter = _ss_inter_account_delay(self.workers, consecutive_deny=cur_deny)
+            if jitter > 0 and idx > 1:
+                if cur_deny > 0 and jitter >= 1.0:
+                    self.log(
+                        f"号间冷却 {jitter:.1f}s（连续MARKED={cur_deny}）",
+                        "info",
+                    )
+                if self._sleep(jitter):
+                    return
             fp = _ss_pick_fp(idx)
             email = None
             try:
+                # 每号开始：force 清本线程 Playwright loop，防池线程复用脏 loop
+                try:
+                    from g.same_session_register import (
+                        _clear_thread_event_loop,
+                        _drop_thread_pool,
+                    )
+
+                    _drop_thread_pool(None, reason="")
+                    _clear_thread_event_loop(force=True)
+                except Exception:
+                    pass
+
                 # Solver 不在线不建邮
                 if not (turnstile_service.yescaptcha_key or "").strip():
                     try:
@@ -2182,6 +2359,28 @@ class RegisterEngine:
                         if self._sleep(5):
                             return
                         continue
+
+                # 连续浏览器/loop 炸：先歇一会再清，别狂建邮
+                if consecutive_browser_fails >= 3:
+                    self.log(
+                        f"连续浏览器失败 {consecutive_browser_fails} 次 · "
+                        f"强制清 loop 并冷却 2s（暂不建邮）",
+                        "warn",
+                    )
+                    try:
+                        from g.same_session_register import (
+                            _clear_thread_event_loop,
+                            _drop_thread_pool,
+                            shutdown_camoufox_pool,
+                        )
+
+                        _drop_thread_pool(None, reason="连续失败")
+                        _clear_thread_event_loop(force=True)
+                    except Exception:
+                        pass
+                    if self._sleep(2.0):
+                        return
+                    consecutive_browser_fails = 0
 
                 # Turnstile 预解与建邮/浏览器重叠
                 ts_pre: dict[str, Any] = {
@@ -2216,27 +2415,48 @@ class RegisterEngine:
                     _jwt, email = email_service.create_email()
                     current_email = email
                 except Exception as e:
-                    self._fail_account(email_service, None, f"邮箱服务异常: {e}")
+                    # 未真正建邮成功：不占创邮额度、不记过程失败
+                    self.log(f"邮箱服务异常（未建邮）: {e}", "warn")
                     if self._sleep(2):
                         return
                     continue
                 if not email:
-                    self._fail_account(email_service, None, "创建邮箱失败")
+                    self.log("创建邮箱失败（未建邮）", "warn")
                     if self._sleep(1):
                         return
                     continue
-                if self.stop_event.is_set():
-                    try:
-                        email_service.delete_email(email)
-                    except Exception:
-                        pass
-                    return
+                # 创邮成功即占 1 次额度（对齐 standalone：COUNT=创邮次数）
+                with self._ss_attempt_lock:
+                    self.attempt_count = int(self.attempt_count or 0) + 1
+                    attempt_i = self.attempt_count
+                # 注意：额度已占就绝不能因 stop_event 直接删邮 return。
+                # 其它线程「创邮达量」停批时，本号必须继续跑完 risk/落盘。
 
                 password = generate_random_string(14)
                 given = generate_random_name()
                 family = generate_random_name()
+                vp = fp.get("viewport") or {}
+                # 语言包跟随地区，传给 same_session（Accept-Language / navigator）
+                try:
+                    from g.same_session_register import locale_language_pack
+
+                    _lp = locale_language_pack(fp.get("locale") or "en-US")
+                    fp["locale"] = _lp["locale"]
+                    fp["accept_language"] = _lp["accept_language"]
+                    fp["languages"] = _lp["languages"]
+                    fp["lang"] = _lp["lang"]
+                except Exception:
+                    fp.setdefault("accept_language", "")
                 self.log(
-                    f"开始注册[same_session]: {email} · {fp['tag']}/{fp['fp_os']}/{fp['timing']}",
+                    f"开始注册[same_session]: {email} · "
+                    f"[{attempt_i}/{max_attempts}] · "
+                    f"{fp['tag']}/{fp['fp_os']}/{fp['timing']} · "
+                    f"{fp.get('locale')}/{fp.get('timezone')} · "
+                    f"al={str(fp.get('accept_language') or '')[:28]} · "
+                    f"vp={vp.get('width')}x{vp.get('height')}"
+                    f"{' · humanize' if fp.get('humanize') else ''} · "
+                    f"CLEAN={self.success_count} MARKED={getattr(self, 'marked_count', 0)} "
+                    f"fail={self.fail_count}",
                     "info",
                 )
 
@@ -2295,31 +2515,47 @@ class RegisterEngine:
                     log=_ss_log_msg,
                 )
 
-                if self.stop_event.is_set():
-                    try:
-                        email_service.delete_email(email)
-                    except Exception:
-                        pass
-                    return
+                # 注意：创邮达量会 set stop_event，但本号若已在飞（甚至已拿 SSO）
+                # 绝不能直接 return 丢号。先看结果，有 SSO 必须走 risk/落盘。
+                stopped_mid = self.stop_event.is_set()
 
                 if not ss.get("ok"):
                     err = ss.get("error") or "same_session failed"
+                    err_l = str(err).lower()
+                    if (
+                        "asyncio loop" in err_l
+                        or "sync api" in err_l
+                        or "camoufox 启动" in err_l
+                        or "playwright" in err_l
+                    ):
+                        consecutive_browser_fails += 1
+                    else:
+                        consecutive_browser_fails = 0
                     self._fail_account(
                         email_service, email, f"{email} same_session 失败: {err}"
                     )
                     current_email = None
-                    if self._sleep(0.3):
+                    # 已停批且本号失败：本线程退出（别再开新邮）
+                    if stopped_mid:
+                        return
+                    # 浏览器 loop 类失败：本线程多歇一会再接下号
+                    cool = 1.2 if consecutive_browser_fails else 0.3
+                    if self._sleep(cool):
                         return
                     continue
 
                 sso = (ss.get("sso") or "").strip()
                 sso_rw = (ss.get("sso_rw") or sso or "").strip()
                 if not sso:
+                    consecutive_browser_fails = 0
                     self._fail_account(
                         email_service, email, f"{email} same_session 无 sso"
                     )
                     current_email = None
+                    if stopped_mid:
+                        return
                     continue
+                consecutive_browser_fails = 0
 
                 castle_len = ss.get("castle_len") or 0
                 castle_method = ss.get("castle_method") or ""
@@ -2330,11 +2566,18 @@ class RegisterEngine:
                         steps_tail = " · " + " > ".join(str(x) for x in steps[-6:])
                 except Exception:
                     steps_tail = ""
-                self.log(
-                    f"{email} same_session SSO 到手 · castle={castle_len}"
-                    f"/{castle_method}{steps_tail} · 先 risk 再决定是否计成功",
-                    "info",
-                )
+                if stopped_mid:
+                    self.log(
+                        f"{email} 停批后仍拿到 SSO · 继续 risk/落盘（不丢号）"
+                        f" · castle={castle_len}/{castle_method}{steps_tail}",
+                        "warn",
+                    )
+                else:
+                    self.log(
+                        f"{email} same_session SSO 到手 · castle={castle_len}"
+                        f"/{castle_method}{steps_tail} · 先 risk 再决定是否计成功",
+                        "info",
+                    )
                 # 仅 forensic 紧急盘，不写主成功文件、不进成功列表
                 # （MARKED 会被绕过，绝不进 recent_success / 不导入）
                 try:
@@ -2346,7 +2589,7 @@ class RegisterEngine:
                 except Exception:
                     pass
 
-                # 前台 risk 门禁：只有 CLEAN 才计成功 / 换 token / 可导入
+                # 前台 risk 门禁：只有 CLEAN 才计成功 / 可导入；换 token 异步
                 clean = self._probe_and_mark_clean(
                     email=email,
                     sso=sso,
@@ -2359,9 +2602,17 @@ class RegisterEngine:
                     # MARKED / 探测失败：已写 _marked，不进成功列表、不换票、不入库
                     # MARKED 只记 marked_count，不再叠 fail_count（避免「目标5却失败7」误解）
                     if clean is False:
+                        with self._ss_deny_lock:
+                            self._ss_consecutive_deny = (
+                                int(self._ss_consecutive_deny or 0) + 1
+                            )
+                            streak = self._ss_consecutive_deny
                         reason = (
                             f"{email} risk MARKED，绕过成功列表与导入"
-                            f"（MARKED 累计 {getattr(self, 'marked_count', 0)}）"
+                            f"（MARKED累计 {getattr(self, 'marked_count', 0)}"
+                            f" · 连续 {streak}"
+                            + (f"/{deny_break_n}" if deny_break_n else "")
+                            + "）"
                         )
                         self._fail_account(
                             email_service,
@@ -2370,17 +2621,29 @@ class RegisterEngine:
                             level="warn",
                             count_fail=False,
                         )
+                        if deny_break_n > 0 and streak >= deny_break_n:
+                            self.log(
+                                f"连续 MARKED/deny 已达 {streak} · 熔断停批",
+                                "error",
+                            )
+                            self.stop_event.set()
+                            return
                     else:
                         reason = f"{email} risk 探测失败，绕过成功列表与导入"
                         self._fail_account(
                             email_service, email, reason, level="warn"
                         )
                     current_email = None
+                    # 停批后本号已收尾：退出本线程，不再开新邮
+                    if stopped_mid or self.stop_event.is_set():
+                        return
                     if self._sleep(0.2):
                         return
                     continue
 
-                # —— 仅 CLEAN 路径 ——
+                # —— 仅 CLEAN 路径：清零连续 MARKED ——
+                with self._ss_deny_lock:
+                    self._ss_consecutive_deny = 0
                 ua = (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -2400,16 +2663,13 @@ class RegisterEngine:
                 )
                 if sid:
                     self._update_success_meta(
-                        sid, clean=True, note="risk=CLEAN · token=pending"
+                        sid, clean=True, note="risk=CLEAN · token=async"
                     )
-                    self._exchange_token_after_clean(
-                        email=email,
-                        sso=sso,
-                        success_id=sid,
-                        impersonate="chrome131",
-                        user_agent=ua,
+                    # 换 token + 协议/NSFW 全部丢 enrich 池，主路径立刻开下一号
+                    self.log(
+                        f"{email} CLEAN 已计成功 · 换 token/协议/NSFW 异步处理中",
+                        "info",
                     )
-                    # 协议/NSFW 仍后台；token 已前台换过
                     self._schedule_enrich(
                         email=email,
                         sso=sso,
@@ -2417,9 +2677,18 @@ class RegisterEngine:
                         success_id=sid,
                         impersonate="chrome131",
                         user_agent=ua,
-                        skip_token=True,
+                        skip_token=False,
+                    )
+                elif stopped_mid:
+                    # 目标已满但仍拿到 CLEAN SSO：_record_success 已写 emergency
+                    self.log(
+                        f"{email} CLEAN 但目标已满 · SSO 已进 emergency（不进成功列表）",
+                        "warn",
                     )
                 current_email = None
+                # 停批后本号收尾完，退出；不 continue 再开新邮
+                if stopped_mid or self.stop_event.is_set():
+                    return
                 continue
             except Exception as e:
                 if self.stop_event.is_set():
@@ -2881,10 +3150,17 @@ class RegisterEngine:
                 if mode == "same_session"
                 else self.register_single_thread
             )
-            self.log(
-                f"启动 {workers} 个线程，目标 {self.target_count} 个 · 路径={mode}",
-                "info",
-            )
+            if mode == "same_session":
+                self.log(
+                    f"启动 {workers} 线程 · 创邮数量 {self.target_count}"
+                    f"（失败/MARKED 也占 1 次）· 路径={mode}",
+                    "info",
+                )
+            else:
+                self.log(
+                    f"启动 {workers} 个线程，目标 CLEAN {self.target_count} 个 · 路径={mode}",
+                    "info",
+                )
             self.log(f"输出: {self.output_file}", "info")
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
                 self._executor = executor
@@ -2948,28 +3224,16 @@ class RegisterEngine:
                     pass
             if self.status == "error":
                 pass
-            elif self.stop_event.is_set() and self.success_count < self.target_count:
-                self.status = "done"
-                self.log(
-                    f"任务已停止：CLEAN成功 {self.success_count}/{self.target_count}，"
-                    f"过程失败 {self.fail_count}，MARKED {getattr(self, 'marked_count', 0)}"
-                    f"（目标只计成功，失败/MARKED 是废号尝试，不是多要了码）",
-                    "warn",
-                )
             else:
                 self.status = "done"
-                # 口径：目标=CLEAN成功数；过程失败=注册链路挂掉；MARKED=风控废号（另计）
-                attempts = (
-                    int(self.success_count)
-                    + int(self.fail_count)
-                    + int(getattr(self, "marked_count", 0) or 0)
-                )
+                # 口径：数量=创邮次数；CLEAN/MARKED/过程失败分开计
+                attempts = int(getattr(self, "attempt_count", 0) or 0)
                 self.log(
-                    f"任务结束：CLEAN成功 {self.success_count}/{self.target_count}"
-                    f"（目标达成）· 过程失败 {self.fail_count}"
-                    f"· MARKED {getattr(self, 'marked_count', 0)}"
-                    f"· 总尝试约 {attempts}"
-                    f"（失败/MARKED 是废号，不是额外目标）",
+                    f"任务结束：创邮 {attempts}/{self.target_count}"
+                    f" · CLEAN {self.success_count}"
+                    f" · 过程失败 {self.fail_count}"
+                    f" · MARKED {getattr(self, 'marked_count', 0)}"
+                    f" · 连续MARKED {getattr(self, '_ss_consecutive_deny', 0)}",
                     "success" if self.success_count else "warn",
                 )
         except Exception as e:
@@ -3144,6 +3408,8 @@ class RegisterEngine:
             self.fail_count = 0
             self.clean_count = 0
             self.marked_count = 0
+            self.attempt_count = 0
+            self._ss_consecutive_deny = 0
             self.target_count = target
             self.workers = workers
             self.register_mode = reg_mode

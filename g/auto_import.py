@@ -9,10 +9,11 @@ from typing import Any, Callable, Optional
 
 def auto_import_enabled() -> bool:
     """
-    默认关闭自动入库（主流程不入库，页面手动导入）。
-    开启：AUTO_IMPORT=1 / true / on / yes
+    CLEAN 成功号自动入库 sub2api。
+    开启：AUTO_IMPORT=1 / true / on / yes（.env 默认 1）
+    关闭：AUTO_IMPORT=0 / false / off / no
     """
-    raw = (os.environ.get("AUTO_IMPORT") or "0").strip().lower()
+    raw = (os.environ.get("AUTO_IMPORT") or "1").strip().lower()
     return raw in ("1", "true", "on", "yes", "y")
 
 
