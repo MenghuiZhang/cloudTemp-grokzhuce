@@ -1896,20 +1896,10 @@ class RegisterEngine:
             self.log(f"{email} risk 探测开始…", "info")
             t0 = time.time()
             ab = AntibotService()
-
-            def _risk_log(msg: str, level: str = "info") -> None:
-                # 进度回调：带邮箱前缀，方便多 worker 日志里对上号
-                self.log(f"{email} {msg}", level)
-
             # chrome124 经本地代理稳；chrome131 易 curl(35) OPENSSL invalid library
-            # probe 内部：fast 短链 + 代理挂了尽快切直连；log_fn 打逐步进度
+            # probe 内部：多 impersonate + 代理失败后直连兜底
             risk = ab.probe_account_risk(
-                sso,
-                sso_rw=sso_rw or sso,
-                impersonate="chrome124",
-                timeout=10,
-                fast=True,
-                log_fn=_risk_log,
+                sso, sso_rw=sso_rw or sso, impersonate="chrome124", timeout=20
             )
             # 仍基建失败：强制直连再打一轮（绕开 7897 TLS 抖动）
             if AntibotService.is_risk_infra_error(risk):
@@ -1917,7 +1907,7 @@ class RegisterEngine:
                     f"{email} risk 基建抖动 · {AntibotService.risk_mark_summary(risk)[:80]} · 直连重试…",
                     "warn",
                 )
-                time.sleep(0.15)
+                time.sleep(0.4)
                 prev_force = os.environ.get("GROK_RISK_FORCE_DIRECT")
                 try:
                     os.environ["GROK_RISK_FORCE_DIRECT"] = "1"
@@ -1925,9 +1915,7 @@ class RegisterEngine:
                         sso,
                         sso_rw=sso_rw or sso,
                         impersonate="chrome124",
-                        timeout=12,
-                        fast=True,
-                        log_fn=_risk_log,
+                        timeout=25,
                     )
                 finally:
                     if prev_force is None:

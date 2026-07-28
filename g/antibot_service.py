@@ -14,7 +14,7 @@ import re
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 from curl_cffi import requests
 
@@ -32,13 +32,6 @@ _IMPERSONATE_FALLBACKS = (
     "chrome120",
     "chrome131",
     "chrome110",
-    "chrome",
-)
-
-# risk 快速链：优先 chrome124，少试几次，避免卡 1～2 分钟
-_RISK_IMPERSONATE_FAST = (
-    "chrome124",
-    "chrome120",
     "chrome",
 )
 
@@ -65,22 +58,13 @@ def _is_infra_error_text(msg: str) -> bool:
     return any(m in low for m in _INFRA_ERR_MARKERS)
 
 
-def _impersonate_chain(preferred: str = "", *, fast: bool = False) -> list[str]:
+def _impersonate_chain(preferred: str = "") -> list[str]:
     pref = (preferred or "").strip() or "chrome124"
-    pool = _RISK_IMPERSONATE_FAST if fast else _IMPERSONATE_FALLBACKS
     out: list[str] = []
-    for x in (pref, *pool):
+    for x in (pref, *_IMPERSONATE_FALLBACKS):
         if x and x not in out:
             out.append(x)
     return out
-
-
-def _risk_proxy_configured() -> bool:
-    """是否配置了业务代理（GROK_PROXY 等）；未配置时 risk 不必走 proxy×N 再 direct×N。"""
-    for key in ("GROK_PROXY", "XAI_PROXY", "SAME_SESSION_PROXY"):
-        if (os.environ.get(key) or "").strip():
-            return True
-    return False
 
 
 def _proxy_kwargs(*, force_direct: bool = False) -> dict:
@@ -219,11 +203,9 @@ class AntibotService:
         sso: str,
         *,
         sso_rw: str = "",
-        impersonate: str = "chrome124",
+        impersonate: str = "chrome131",
         user_agent: Optional[str] = None,
-        timeout: int = 10,
-        fast: bool = True,
-        log_fn: Optional[Callable[..., None]] = None,
+        timeout: int = 15,
     ) -> dict[str, Any]:
         """
         读 GetUser(grpc) + REST /rest/auth/get-user + session，判定风控。
@@ -240,9 +222,6 @@ class AntibotService:
           policy, event, castle_status, acl_strings, email_domain,
           user_id, email, signals, raw_strings, rest_user, error,
           infra_error（TLS/代理等基建失败，禁止当 MARKED）
-
-        fast=True（默认）: 短 impersonate 链 + 代理连续基建失败后尽快切直连；
-        log_fn(msg, level="info"): 可选进度回调（注册机打「risk 试 proxy:chrome124…」）。
         """
         sso = (sso or "").strip()
         rw = (sso_rw or sso or "").strip()
@@ -274,60 +253,19 @@ class AntibotService:
             out["error"] = "缺少 sso"
             return out
 
-        def _log(msg: str, level: str = "info") -> None:
-            if not log_fn:
-                return
-            try:
-                log_fn(msg, level)
-            except TypeError:
-                try:
-                    log_fn(msg)
-                except Exception:
-                    pass
-            except Exception:
-                pass
-
         ua = user_agent or DEFAULT_UA
         last_infra_err: Optional[str] = None
-        chain = _impersonate_chain(impersonate or "chrome124", fast=fast)
-        has_proxy = _risk_proxy_configured()
-        # 无业务代理时只打「直连」链，避免 proxy×N 再 direct×N 白耗时
-        path_specs: list[tuple[str, bool]] = []
-        if has_proxy:
-            for imp in chain:
-                path_specs.append((imp, False))
-            # 直连兜底：fast 只留 2 个；完整链再多 1 个
-            direct_imps = ("chrome124", "chrome120") if fast else ("chrome124", "chrome123", "chrome120")
-            for imp in direct_imps:
-                path_specs.append((imp, True))
-        else:
-            for imp in chain:
-                path_specs.append((imp, True))
+        # 路径：代理×多 impersonate → 直连×稳 impersonate
+        # chrome131+本地代理常 curl(35) OPENSSL invalid library；chrome124 稳
+        path_specs: list[tuple[str, bool]] = [
+            (imp, False) for imp in _impersonate_chain(impersonate or "chrome124")
+        ]
+        # 代理全挂后直连兜底（只试最稳的几个，避免拖太久）
+        for imp in ("chrome124", "chrome123", "chrome120"):
+            path_specs.append((imp, True))
 
-        total = len(path_specs)
-        # 代理连续基建失败几次后跳过剩余 proxy 路径，直接进 direct
-        proxy_infra_streak = 0
-        proxy_skip_after = 1 if fast else 2
-        skipped_proxy = 0
-
-        _log(
-            f"risk 路径 {total} 步 · "
-            f"{'有代理' if has_proxy else '无代理/直连'} · "
-            f"imp={','.join(chain)} · timeout={timeout}s"
-            + (" · fast" if fast else ""),
-            "info",
-        )
-
-        for idx, (imp, direct) in enumerate(path_specs, start=1):
-            # 代理连续挂：跳过后续 proxy 尝试
-            if has_proxy and not direct and proxy_infra_streak >= proxy_skip_after:
-                skipped_proxy += 1
-                continue
-
-            mode = "direct" if direct else "proxy"
-            tag = f"{mode}:{imp}"
-            _log(f"risk 试 [{idx}/{total}] {tag}…", "info")
-            t1 = time.time()
+        for imp, direct in path_specs:
+            tag = f"{'direct' if direct else 'proxy'}:{imp}"
             try:
                 result = self._probe_account_risk_once(
                     sso,
@@ -338,12 +276,8 @@ class AntibotService:
                     base_out=out,
                     force_direct=direct,
                 )
-                elapsed_try = round(time.time() - t1, 1)
                 if result.get("infra_error"):
                     last_infra_err = str(result.get("error") or "infra")
-                    err_short = (last_infra_err or "")[:80]
-                    if not direct:
-                        proxy_infra_streak += 1
                     out["signals"] = list(
                         dict.fromkeys(
                             list(out.get("signals") or [])
@@ -351,24 +285,8 @@ class AntibotService:
                             + [f"infra_try:{tag}"]
                         )
                     )
-                    _log(
-                        f"risk 基建失败 [{idx}/{total}] {tag} · {elapsed_try}s · {err_short}"
-                        + (
-                            " · 将尽快切直连"
-                            if (
-                                has_proxy
-                                and not direct
-                                and proxy_infra_streak >= proxy_skip_after
-                            )
-                            else ""
-                        ),
-                        "warn",
-                    )
-                    time.sleep(0.05)
+                    time.sleep(0.2)
                     continue
-                # 业务结果（CLEAN / MARKED / 死会话）
-                if not direct:
-                    proxy_infra_streak = 0
                 result["impersonate_used"] = imp
                 if direct:
                     result.setdefault("signals", [])
@@ -376,41 +294,20 @@ class AntibotService:
                     if "risk_via_direct" not in sigs:
                         sigs.append("risk_via_direct")
                     result["signals"] = sorted(set(sigs))
-                if skipped_proxy:
-                    result.setdefault("signals", [])
-                    result["signals"] = list(
-                        dict.fromkeys(
-                            list(result.get("signals") or [])
-                            + [f"skipped_proxy_paths:{skipped_proxy}"]
-                        )
-                    )
-                _log(
-                    f"risk 完成 [{idx}/{total}] {tag} · {elapsed_try}s · "
-                    f"{AntibotService.risk_mark_summary(result)[:100]}",
-                    "info",
-                )
                 return result
             except Exception as e:
                 err_s = str(e)
-                elapsed_try = round(time.time() - t1, 1)
                 if _is_infra_error_text(err_s):
                     last_infra_err = err_s
-                    if not direct:
-                        proxy_infra_streak += 1
                     out["signals"] = list(
                         dict.fromkeys(
                             list(out.get("signals") or [])
                             + [f"infra_try:{tag}:{err_s[:40]}"]
                         )
                     )
-                    _log(
-                        f"risk 异常基建 [{idx}/{total}] {tag} · {elapsed_try}s · {err_s[:80]}",
-                        "warn",
-                    )
-                    time.sleep(0.05)
+                    time.sleep(0.2)
                     continue
                 out["error"] = err_s
-                _log(f"risk 业务异常 [{idx}/{total}] {tag} · {err_s[:100]}", "warn")
                 return out
 
         # 全部路径基建失败：明确 infra_error，调用方不得记 MARKED
@@ -422,16 +319,6 @@ class AntibotService:
         out["cli_usable"] = None
         out["error"] = last_infra_err or "risk probe TLS/proxy failed"
         out["cli_blocked_reason"] = f"infra_error: {out['error']}"
-        if skipped_proxy:
-            out["signals"] = list(
-                dict.fromkeys(
-                    list(out.get("signals") or []) + [f"skipped_proxy_paths:{skipped_proxy}"]
-                )
-            )
-        _log(
-            f"risk 全部路径基建失败 · {str(out['error'])[:100]}",
-            "warn",
-        )
         return out
 
     def _probe_account_risk_once(
@@ -1434,7 +1321,7 @@ class AntibotService:
         model: str = "grok-3",
         prefer_browser: bool = True,
         headless: bool = True,
-        impersonate: str = "chrome124",
+        impersonate: str = "chrome131",
         user_agent: Optional[str] = None,
     ) -> dict[str, Any]:
         """
@@ -1445,7 +1332,6 @@ class AntibotService:
             sso_rw=sso_rw,
             impersonate=impersonate,
             user_agent=user_agent,
-            fast=True,
         )
         out: dict[str, Any] = {"risk": risk}
 
