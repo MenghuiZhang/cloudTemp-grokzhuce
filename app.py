@@ -91,7 +91,9 @@ engine = RegisterEngine(log_fn=_route_engine_log)
 CONFIG_KEYS = (
     "WORKER_DOMAIN",
     "FREEMAIL_TOKEN",
+    "FREEMAIL_ADMIN_KEY",
     "FREEMAIL_DOMAIN",
+    "FREEMAIL_RANDOM_SUBDOMAIN",
     "FREEMAIL_API_STYLE",
     "YESCAPTCHA_KEY",
     "SOLVER_URL",
@@ -115,12 +117,17 @@ CONFIG_KEYS = (
     "UPSTREAM_ADMIN_EMAIL",
     "UPSTREAM_ADMIN_PASSWORD",
     "GROK_PROXY",
+    "EMAIL_TYPE",
+    "OUTLOOK_ACCOUNTS",
+    "OUTLOOK_ALIAS_LIMIT",
 )
 
 DEFAULTS = {
     "WORKER_DOMAIN": "",
     "FREEMAIL_TOKEN": "",
+    "FREEMAIL_ADMIN_KEY": "",
     "FREEMAIL_DOMAIN": "auto",
+    "FREEMAIL_RANDOM_SUBDOMAIN": "0",
     "FREEMAIL_API_STYLE": "auto",
     "YESCAPTCHA_KEY": "",
     "SOLVER_URL": "http://127.0.0.1:5072",
@@ -145,7 +152,25 @@ DEFAULTS = {
     "UPSTREAM_ADMIN_PASSWORD": "",
     # 注册代理：空=直连；支持 host:port / http://host:port / user:pass@host:port / host:port:user:pass
     "GROK_PROXY": "",
+    "EMAIL_TYPE": "freemail",
+    "OUTLOOK_ACCOUNTS": "",
+    "OUTLOOK_ALIAS_LIMIT": "5",
 }
+
+
+def _decode_config_value(key: str, value: str) -> str:
+    if key == "OUTLOOK_ACCOUNTS":
+        return value.replace("\\n", "\n")
+    return value
+
+
+def _encode_config_value(key: str, value: object) -> str:
+    text = str(value or "")
+    if key == "OUTLOOK_ACCOUNTS":
+        return text.replace("\r\n", "\n").replace("\r", "\n").replace(
+            "\n", "\\n"
+        )
+    return text
 
 
 def read_env_file() -> dict:
@@ -163,7 +188,9 @@ def read_env_file() -> dict:
         key, val = raw.split("=", 1)
         key = key.strip()
         if key in CONFIG_KEYS:
-            data[key] = val.strip().strip('"').strip("'")
+            data[key] = _decode_config_value(
+                key, val.strip().strip('"').strip("'")
+            )
     # process env overrides missing blanks only for runtime consistency
     for k in CONFIG_KEYS:
         if not data.get(k):
@@ -185,7 +212,7 @@ def write_env_file(values: dict) -> None:
             continue
         key = stripped.split("=", 1)[0].strip()
         if key in values:
-            out.append(f"{key}={values[key]}")
+            out.append(f"{key}={_encode_config_value(key, values[key])}")
             written.add(key)
         else:
             out.append(line)
@@ -195,7 +222,8 @@ def write_env_file(values: dict) -> None:
         if key not in written:
             if out and out[-1].strip():
                 out.append("")
-            out.append(f"{key}={values.get(key, DEFAULTS.get(key, ''))}")
+            value = values.get(key, DEFAULTS.get(key, ""))
+            out.append(f"{key}={_encode_config_value(key, value)}")
 
     # ensure example comments if file was empty
     if not existing_lines:
@@ -203,8 +231,16 @@ def write_env_file(values: dict) -> None:
             "# freemail API 配置",
             f"WORKER_DOMAIN={values.get('WORKER_DOMAIN', '')}",
             f"FREEMAIL_TOKEN={values.get('FREEMAIL_TOKEN', '')}",
+            f"FREEMAIL_ADMIN_KEY={values.get('FREEMAIL_ADMIN_KEY', '')}",
             f"FREEMAIL_DOMAIN={values.get('FREEMAIL_DOMAIN', DEFAULTS['FREEMAIL_DOMAIN'])}",
+            f"FREEMAIL_RANDOM_SUBDOMAIN={values.get('FREEMAIL_RANDOM_SUBDOMAIN', DEFAULTS['FREEMAIL_RANDOM_SUBDOMAIN'])}",
             f"FREEMAIL_API_STYLE={values.get('FREEMAIL_API_STYLE', DEFAULTS['FREEMAIL_API_STYLE'])}",
+            "",
+            "# Outlook/Hotmail 加号地址",
+            f"EMAIL_TYPE={values.get('EMAIL_TYPE', DEFAULTS['EMAIL_TYPE'])}",
+            "OUTLOOK_ACCOUNTS="
+            f"{_encode_config_value('OUTLOOK_ACCOUNTS', values.get('OUTLOOK_ACCOUNTS', ''))}",
+            f"OUTLOOK_ALIAS_LIMIT={values.get('OUTLOOK_ALIAS_LIMIT', DEFAULTS['OUTLOOK_ALIAS_LIMIT'])}",
             "",
             "# Turnstile 验证配置",
             "# 如果不填则使用本地 Turnstile Solver",
@@ -269,6 +305,12 @@ def env_snapshot():
     token = cfg.get("FREEMAIL_TOKEN", "").strip()
     yes = cfg.get("YESCAPTCHA_KEY", "").strip()
     mail_domain = (cfg.get("FREEMAIL_DOMAIN") or DEFAULTS["FREEMAIL_DOMAIN"]).strip() or "auto"
+    random_subdomain = str(
+        cfg.get(
+            "FREEMAIL_RANDOM_SUBDOMAIN",
+            DEFAULTS["FREEMAIL_RANDOM_SUBDOMAIN"],
+        )
+    ).lower() in ("1", "true", "yes", "on")
     sub2 = get_sub2api_config_from_cfg(cfg)
     sub2_url = sub2["url"]
     admin_email = sub2.get("admin_email") or ""
@@ -281,6 +323,7 @@ def env_snapshot():
         "yescaptcha_set": bool(yes),
         "worker_domain": worker,
         "freemail_domain": mail_domain,
+        "freemail_random_subdomain": random_subdomain,
         "solver_url": cfg.get("SOLVER_URL") or DEFAULTS["SOLVER_URL"],
         "solver_browser": cfg.get("SOLVER_BROWSER") or DEFAULTS["SOLVER_BROWSER"],
         "solver_threads": cfg.get("SOLVER_THREADS") or DEFAULTS["SOLVER_THREADS"],
@@ -298,6 +341,9 @@ def env_snapshot():
         "upstream_url": sub2_url,
         "upstream_configured": configured,
         "upstream_password_set": bool(admin_password),
+        "email_type": cfg.get("EMAIL_TYPE") or DEFAULTS.get("EMAIL_TYPE", "freemail"),
+        "outlook_accounts": cfg.get("OUTLOOK_ACCOUNTS") or "",
+        "outlook_alias_limit": cfg.get("OUTLOOK_ALIAS_LIMIT") or "5",
     }
 
 
@@ -1767,7 +1813,12 @@ def get_config():
         "config": {
             "WORKER_DOMAIN": cfg.get("WORKER_DOMAIN", ""),
             "FREEMAIL_TOKEN": cfg.get("FREEMAIL_TOKEN", ""),
+            "FREEMAIL_ADMIN_KEY": cfg.get("FREEMAIL_ADMIN_KEY", ""),
             "FREEMAIL_DOMAIN": cfg.get("FREEMAIL_DOMAIN", DEFAULTS["FREEMAIL_DOMAIN"]),
+            "FREEMAIL_RANDOM_SUBDOMAIN": cfg.get(
+                "FREEMAIL_RANDOM_SUBDOMAIN",
+                DEFAULTS["FREEMAIL_RANDOM_SUBDOMAIN"],
+            ),
             "FREEMAIL_API_STYLE": cfg.get("FREEMAIL_API_STYLE", DEFAULTS["FREEMAIL_API_STYLE"]),
             "YESCAPTCHA_KEY": cfg.get("YESCAPTCHA_KEY", ""),
             "SOLVER_URL": cfg.get("SOLVER_URL", DEFAULTS["SOLVER_URL"]),
@@ -1791,10 +1842,14 @@ def get_config():
             "UPSTREAM_URL": cfg.get("SUB2API_URL", cfg.get("UPSTREAM_URL", DEFAULTS["SUB2API_URL"])),
             "UPSTREAM_ADMIN_EMAIL": cfg.get("UPSTREAM_ADMIN_EMAIL", ""),
             "UPSTREAM_ADMIN_PASSWORD": cfg.get("UPSTREAM_ADMIN_PASSWORD", ""),
+            "EMAIL_TYPE": cfg.get("EMAIL_TYPE", DEFAULTS["EMAIL_TYPE"]),
+            "OUTLOOK_ACCOUNTS": cfg.get("OUTLOOK_ACCOUNTS", ""),
+            "OUTLOOK_ALIAS_LIMIT": cfg.get("OUTLOOK_ALIAS_LIMIT", DEFAULTS["OUTLOOK_ALIAS_LIMIT"]),
             "captcha_mode": "yescaptcha" if cfg.get("YESCAPTCHA_KEY", "").strip() else "local",
         },
         "masked": {
             "FREEMAIL_TOKEN": mask_secret(cfg.get("FREEMAIL_TOKEN", "")),
+            "FREEMAIL_ADMIN_KEY": mask_secret(cfg.get("FREEMAIL_ADMIN_KEY", "")),
             "YESCAPTCHA_KEY": mask_secret(cfg.get("YESCAPTCHA_KEY", "")),
             "SUB2API_DB_PASSWORD": mask_secret(cfg.get("SUB2API_DB_PASSWORD", DEFAULTS["SUB2API_DB_PASSWORD"])),
             "UPSTREAM_ADMIN_PASSWORD": mask_secret(cfg.get("UPSTREAM_ADMIN_PASSWORD", "")),
@@ -1823,6 +1878,7 @@ def mail_domains():
             "ok": False,
             "domains": [],
             "default_domains": [],
+            "random_subdomain_domains": [],
             "selected": "auto",
             "message": str(e),
             "settings": {},
@@ -1839,7 +1895,26 @@ def save_config():
 
     worker = str(body.get("WORKER_DOMAIN", current.get("WORKER_DOMAIN", ""))).strip()
     token = str(body.get("FREEMAIL_TOKEN", current.get("FREEMAIL_TOKEN", ""))).strip()
+    admin_key = str(
+        body.get(
+            "FREEMAIL_ADMIN_KEY",
+            current.get("FREEMAIL_ADMIN_KEY", ""),
+        )
+    ).strip()
     mail_domain = str(body.get("FREEMAIL_DOMAIN", current.get("FREEMAIL_DOMAIN", DEFAULTS["FREEMAIL_DOMAIN"]))).strip() or "auto"
+    random_subdomain_raw = body.get(
+        "FREEMAIL_RANDOM_SUBDOMAIN",
+        current.get(
+            "FREEMAIL_RANDOM_SUBDOMAIN",
+            DEFAULTS["FREEMAIL_RANDOM_SUBDOMAIN"],
+        ),
+    )
+    random_subdomain = str(random_subdomain_raw).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
     api_style = str(body.get("FREEMAIL_API_STYLE", current.get("FREEMAIL_API_STYLE", DEFAULTS["FREEMAIL_API_STYLE"]))).strip() or "auto"
     yes = str(body.get("YESCAPTCHA_KEY", current.get("YESCAPTCHA_KEY", ""))).strip()
     solver = str(body.get("SOLVER_URL", current.get("SOLVER_URL", DEFAULTS["SOLVER_URL"]))).strip()
@@ -1880,10 +1955,15 @@ def save_config():
     upstream_url = sub2api_url
     upstream_email = str(body.get("UPSTREAM_ADMIN_EMAIL", current.get("UPSTREAM_ADMIN_EMAIL", ""))).strip()
     upstream_pwd = str(body.get("UPSTREAM_ADMIN_PASSWORD", current.get("UPSTREAM_ADMIN_PASSWORD", ""))).strip()
+    email_type = str(body.get("EMAIL_TYPE", current.get("EMAIL_TYPE", DEFAULTS["EMAIL_TYPE"]))).strip().lower()
+    outlook_accounts = str(body.get("OUTLOOK_ACCOUNTS", current.get("OUTLOOK_ACCOUNTS", ""))).strip()
+    outlook_alias_limit = str(body.get("OUTLOOK_ALIAS_LIMIT", current.get("OUTLOOK_ALIAS_LIMIT", DEFAULTS["OUTLOOK_ALIAS_LIMIT"]))).strip() or "5"
 
     # 允许前端传空密钥表示“保留原值”：用特殊标记
     if body.get("FREEMAIL_TOKEN") is None:
         token = current.get("FREEMAIL_TOKEN", "")
+    if body.get("FREEMAIL_ADMIN_KEY") is None:
+        admin_key = current.get("FREEMAIL_ADMIN_KEY", "")
     if body.get("YESCAPTCHA_KEY") is None:
         yes = current.get("YESCAPTCHA_KEY", "")
     if body.get("UPSTREAM_ADMIN_EMAIL") is None:
@@ -1903,6 +1983,27 @@ def save_config():
         mail_domain = "auto"
     sub2api_url = normalize_upstream_url(sub2api_url) or DEFAULTS["SUB2API_URL"]
     upstream_url = sub2api_url
+
+    if email_type in ("outlook", "outlook-hotmail"):
+        if not outlook_accounts:
+            return jsonify({"ok": False, "message": "邮箱类型为 Outlook 时，必须填写账号列表"}), 400
+        if (
+            not re.fullmatch(r"\d{1,3}", outlook_alias_limit)
+            or not (1 <= int(outlook_alias_limit) <= 999)
+        ):
+            return jsonify(
+                {"ok": False, "message": "Outlook 加号地址上限范围 1-999"}
+            ), 400
+    else:
+        if not worker or not token:
+            return jsonify({"ok": False, "message": "WORKER_DOMAIN 与 FREEMAIL_TOKEN 为必填"}), 400
+        if random_subdomain and mail_domain == "auto":
+            return jsonify(
+                {
+                    "ok": False,
+                    "message": "启用随机子域名时，请选择 RANDOM_SUBDOMAIN_DOMAINS 中的基础域名",
+                }
+            ), 400
 
     if not re.fullmatch(r"\d{2,5}", ui_port):
         return jsonify({"ok": False, "message": "UI_PORT 必须是 2-5 位数字"}), 400
@@ -1925,7 +2026,9 @@ def save_config():
     values = {
         "WORKER_DOMAIN": worker,
         "FREEMAIL_TOKEN": token,
+        "FREEMAIL_ADMIN_KEY": admin_key,
         "FREEMAIL_DOMAIN": mail_domain,
+        "FREEMAIL_RANDOM_SUBDOMAIN": "1" if random_subdomain else "0",
         "FREEMAIL_API_STYLE": api_style,
         "YESCAPTCHA_KEY": yes,
         "SOLVER_URL": solver,
@@ -1949,11 +2052,18 @@ def save_config():
         "UPSTREAM_URL": upstream_url,
         "UPSTREAM_ADMIN_EMAIL": upstream_email,
         "UPSTREAM_ADMIN_PASSWORD": upstream_pwd,
+        "EMAIL_TYPE": email_type,
+        "OUTLOOK_ACCOUNTS": outlook_accounts,
+        "OUTLOOK_ALIAS_LIMIT": outlook_alias_limit,
     }
     try:
         write_env_file(values)
         apply_env_to_process(values)
-        logs.emit(f"配置已保存到 .env（邮箱域名: {mail_domain}）", "success")
+        mail_mode = "随机子域" if random_subdomain else "普通域名"
+        logs.emit(
+            f"配置已保存到 .env（邮箱域名: {mail_domain} · {mail_mode}）",
+            "success",
+        )
 
         # 保存后自动测试 sub2api HTTP 通道，并按名称解析 group_id 回写
         upstream_test = None

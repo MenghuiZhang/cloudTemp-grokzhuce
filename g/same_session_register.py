@@ -764,6 +764,17 @@ def resolve_proxy() -> Optional[dict[str, str]]:
                 return parsed
     return None
 
+
+def resolve_session_proxy(proxy: Optional[str]) -> Optional[dict[str, str]]:
+    """
+    显式传参（包括空字符串）时严格按参数执行。
+    proxy="" 表示强制直连；proxy=None 才允许继承环境代理。
+    """
+    if proxy is not None:
+        return parse_proxy_spec(proxy)
+    return resolve_proxy()
+
+
 # 页内二进制 POST（gRPC-web）：body 以 base64 传入，在页面还原 Uint8Array 后 fetch
 _PAGE_BINARY_POST_JS = """
 async ({url, bodyB64, headers}) => {
@@ -1946,11 +1957,8 @@ def same_session_register(
     conversion_id = new_conversion_id()
     cfg = _load_action_cache()
 
-    # proxy 显式传入优先；否则认 GROK_PROXY / XAI_PROXY（与注册机业务代理对齐）
-    if proxy:
-        proxy_info = parse_proxy_spec(proxy)
-    else:
-        proxy_info = resolve_proxy()
+    # 空字符串也是显式值，代表强制直连；只有 None 才继承环境代理。
+    proxy_info = resolve_session_proxy(proxy)
 
     locale_raw = (locale or os.getenv("GROK_LOCALE") or "").strip() or "en-US"
     lang_pack = locale_language_pack(locale_raw)

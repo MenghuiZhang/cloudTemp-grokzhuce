@@ -59,9 +59,15 @@ CHROME_PROFILES = [
     {"impersonate": "chrome120", "version": "120.0.0.0", "brand": "chrome"},
     {"impersonate": "edge101", "version": "101.0.1210.47", "brand": "edge"},
 ]
-# device flow 有限并发：2 路并行换票，限流时自动退回更保守节奏
-# （全串行太慢；无上限又容易 TLS/rate_limited 把成功率打穿）
-_DEVICE_FLOW_MAX_CONCURRENT = 2
+# device flow 有限并发：默认仍保守为 2；批量转换脚本可通过环境变量提升。
+# 上限 32，避免配置错误产生无界并发。
+try:
+    _DEVICE_FLOW_MAX_CONCURRENT = max(
+        1,
+        min(int(os.environ.get("GROK_DEVICE_FLOW_MAX_CONCURRENT") or "2"), 32),
+    )
+except (TypeError, ValueError):
+    _DEVICE_FLOW_MAX_CONCURRENT = 2
 _DEVICE_FLOW_SEM = threading.Semaphore(_DEVICE_FLOW_MAX_CONCURRENT)
 # 全局冷却：遇到 rate_limited 后，后续 device flow 至少隔这么久
 _device_flow_cooldown_until = 0.0
@@ -161,16 +167,12 @@ _SS_RECENT_FP_SIGS: deque = deque(maxlen=48)
 
 
 def _ss_local_proxy_spec() -> str:
-    """同会话默认本机代理：STANDALONE_LOCAL_PROXY / LOCAL_PROXY / 127.0.0.1:7897。"""
-    raw = (
-        os.environ.get("STANDALONE_LOCAL_PROXY")
-        or os.environ.get("LOCAL_PROXY")
-        or os.environ.get("GROK_SAME_SESSION_PROXY")
-        or "127.0.0.1:7897"
+    """Web 同会话代理；GROK_PROXY 为空时显式直连。"""
+    return (
+        os.environ.get("GROK_SAME_SESSION_PROXY")
+        or os.environ.get("GROK_PROXY")
+        or ""
     ).strip()
-    if not raw:
-        return "127.0.0.1:7897"
-    return raw
 
 
 def _ss_fp_sig(fp: dict[str, Any]) -> str:
@@ -637,26 +639,30 @@ def _request_device_code(timeout: int = 20) -> dict | None:
             "Chrome/131.0.0.0 Safari/537.36"
         ),
     }
-    try:
-        r = requests.post(
-            f"{OIDC_ISSUER}/oauth2/device/code",
-            data=data,
-            headers=headers,
-            impersonate=DEFAULT_IMPERSONATE,
-            timeout=timeout,
-            **_proxy_kw(),
-        )
-        if r.status_code == 429 or "rate" in (r.text or "").lower():
-            return {
-                "_error": f"device/code rate_limited HTTP {r.status_code}: {(r.text or '')[:200]}"
-            }
-        if r.status_code >= 400:
-            return {
-                "_error": f"device/code HTTP {r.status_code}: {(r.text or '')[:200]}"
-            }
-        return r.json()
-    except Exception:
-        pass
+    curl_error = ""
+    for attempt in range(2):
+        try:
+            r = requests.post(
+                f"{OIDC_ISSUER}/oauth2/device/code",
+                data=data,
+                headers=headers,
+                impersonate=DEFAULT_IMPERSONATE,
+                timeout=timeout,
+                **_proxy_kw(),
+            )
+            if r.status_code == 429 or "rate" in (r.text or "").lower():
+                return {
+                    "_error": f"device/code rate_limited HTTP {r.status_code}: {(r.text or '')[:200]}"
+                }
+            if r.status_code >= 400:
+                return {
+                    "_error": f"device/code HTTP {r.status_code}: {(r.text or '')[:200]}"
+                }
+            return r.json()
+        except Exception as e:
+            curl_error = str(e)
+            if attempt == 0:
+                time.sleep(0.25)
     # 回落 urllib
     try:
         req = urllib.request.Request(
@@ -677,7 +683,10 @@ def _request_device_code(timeout: int = 20) -> dict | None:
             return {"_error": f"device/code rate_limited HTTP {e.code}: {body}"}
         return {"_error": f"device/code HTTP {e.code}: {body}"}
     except Exception as e:
-        return {"_error": f"device/code 异常: {e}"}
+        detail = f"{e}"
+        if curl_error:
+            detail += f"；curl_cffi: {curl_error}"
+        return {"_error": f"device/code 异常: {detail}"}
 
 
 def _poll_device_token(
@@ -1082,7 +1091,20 @@ def sso_device_flow_to_token(
                 last_err = (
                     f"device approve 后 token 失败: {token.get('_error')}"
                 )
-                # invalid_grant：换指纹整条重来意义有限，但短歇后仍可再试一次会话
+                # code 已完成 approve 后仍 invalid_grant / access_denied，属于明确终止；
+                # 换 TLS 指纹重做整条 flow 不会修复，只会把坏号耗时放大数倍。
+                terminal = str(token.get("_error") or "").lower()
+                if any(
+                    marker in terminal
+                    for marker in ("invalid_grant", "access denied", "access_denied")
+                ):
+                    return {
+                        "ok": False,
+                        "error": last_err,
+                        "token": None,
+                        "payload": payload,
+                        "approved": True,
+                    }
                 time.sleep(1.0)
                 continue
             if not token or not (token.get("access_token") or token.get("key")):
@@ -1493,7 +1515,8 @@ class RegisterEngine:
                 "success",
             )
             self.log(
-                f"代理={_ss_local_proxy_spec()} · Turnstile 并行预解 · camoufox",
+                f"代理={_ss_local_proxy_spec() or '直连'} · "
+                "Turnstile 并行预解 · camoufox",
                 "info",
             )
             return True
@@ -2285,7 +2308,7 @@ class RegisterEngine:
         self.log(
             f"same_session · 数量={max_attempts}（按创邮次数停）"
             f" · 连续MARKED熔断={deny_break_n or 'off'}"
-            f" · 代理={proxy_spec_str}",
+            f" · 代理={proxy_spec_str or '直连'}",
             "info",
         )
 

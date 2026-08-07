@@ -67,8 +67,13 @@ cp .env.example .env
 |--------|------|------|
 | `WORKER_DOMAIN` | cloudflare_temp_email 的 Worker 域名（不要 `https://`） | — |
 | `FREEMAIL_TOKEN` | 站点密码 / JWT | — |
+| `FREEMAIL_ADMIN_KEY` | `ADMIN_PASSWORDS` 中的管理员密码；填写后通过 `/admin/new_address` 建邮；与站点密码相同时可填 `${FREEMAIL_TOKEN}` | 空 |
 | `FREEMAIL_DOMAIN` | 邮箱后缀；`auto` 用服务端默认 | `auto` |
+| `FREEMAIL_RANDOM_SUBDOMAIN` | `1` 时通过原生 `enableRandomSubdomain` 创建随机子域邮箱 | `0` |
 | `FREEMAIL_API_STYLE` | `auto` / `cf_temp` / `freemail` | `auto` |
+| `EMAIL_TYPE` | `freemail` 或 `outlook-hotmail`（Outlook 加号地址） | `freemail` |
+| `OUTLOOK_ACCOUNTS` | Outlook 账号；每行 `email:应用密码`，或 `email----应用密码----refresh_token----client_id` | 空 |
+| `OUTLOOK_ALIAS_LIMIT` | 每个 Outlook 主账号在一次运行中分配的加号地址上限 | `5` |
 | `YESCAPTCHA_KEY` | 有则走 YesCaptcha；空则本地 Solver | 空 |
 | `SOLVER_URL` | 本地 Solver 地址 | `http://127.0.0.1:5072` |
 | `SOLVER_BROWSER` | `camoufox` / `chromium` | `camoufox` |
@@ -83,6 +88,9 @@ cp .env.example .env
 
 说明：
 
+- Outlook 模式生成 `主账号+随机标签@outlook.com`，邮件仍进入主账号收件箱；这不是微软账户中创建的真实别名。
+- Outlook 收件优先使用 OAuth2；只有账号行未提供 OAuth2 凭据时，才尝试密码或应用密码。使用前需在 Outlook.com 中启用 IMAP。
+- Cloudflare 随机子域模式必须选择 Worker `RANDOM_SUBDOMAIN_DOMAINS` 中的基础域名；Worker 还需配置 `RANDOM_SUBDOMAIN_LENGTH`。Cloudflare DNS 必须为基础域名配置通配 `*` MX 并指向相同邮件路由，否则地址可以创建但无法收件。
 - 页面「配置」里只填**分组名称**；分组 ID 只读显示，保存/测试/导入时自动拉取。
 - 名称匹配的是 sub2api **已有**分组（可跨 platform）；新分组请先在 sub2api 后台创建。
 - 导入主路径：`POST /api/v1/admin/grok/sso-to-oauth`（服务端换票）。
@@ -128,6 +136,41 @@ python grok.py
 ```bash
 python import_batch_once.py keys/your_sso.txt
 ```
+
+### 5. 注册 JSON 转 CPA / sub2api JSON
+
+读取 `register_sso/` 中每个 JSON 的 `sso`，完成 xAI OAuth 换票后，同时输出
+CLIProxyAPI（CPA）可加载的 `type=xai` 单账号文件和 sub2api 可导入的合并文件：
+
+```bash
+python convert_sso_json.py
+```
+
+输出默认保存在 `converted_auth/`，其中 CPA 单账号文件位于
+`converted_auth/cpa/`，sub2api 合并文件位于 `converted_auth/sub2api/`。常用参数：
+
+```bash
+# 只扫描校验，不联网
+python convert_sso_json.py --dry-run
+
+# 默认强制直连；先用 1 个账号验证
+python convert_sso_json.py --direct --limit 1
+
+# 默认 8 路并发，并自动复用 converted_auth/cpa/ 中已有结果继续跑
+python convert_sso_json.py --direct --workers 8
+
+# 如确实需要代理，再显式指定
+python convert_sso_json.py --proxy http://127.0.0.1:7890 --limit 10
+
+# 只生成 sub2api 文件，并写入目标分组 ID
+python convert_sso_json.py --format sub2api --group-id 3
+```
+
+SSO cookie 不能直接作为 CPA OAuth 凭证；正常转换会访问 xAI 完成 device flow，
+因此需要网络可达，且可能受到账号状态和限流影响。输出文件含访问令牌，请勿提交或分享。
+遇到 `rate_limited` 时可将 `--workers` 降为 `4`；如需忽略已有 CPA 缓存并重新换票，
+使用 `--refresh-existing --overwrite`。换票返回 `invalid_grant: Access denied` 时，
+原始账号 JSON 会自动移入 `register_sso/失败/`；可用 `--failed-dir` 指定其他目录。
 
 ## 注册路径
 

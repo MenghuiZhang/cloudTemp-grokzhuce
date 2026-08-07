@@ -28,6 +28,7 @@ venv/
 # 运行产物与隐私数据
 keys/
 logs/
+converted_auth/
 *.log
 *.sqlite
 *.sqlite3

@@ -5,7 +5,9 @@ import os
 import re
 import string
 import random
+import threading
 import time
+from email.utils import getaddresses
 from typing import Optional
 
 import requests
@@ -26,25 +28,83 @@ class EmailService:
     """
     优先适配 dreamhunter2333/cloudflare_temp_email：
       POST /api/new_address
+      POST /admin/new_address（配置 FREEMAIL_ADMIN_KEY 时）
       GET  /api/mails?limit=&offset=
       DELETE /api/delete_address
     FREEMAIL_TOKEN 作为 x-custom-auth（站点密码），不是 JWT。
+    FREEMAIL_ADMIN_KEY 作为 x-admin-auth（管理员密码）。
     每个邮箱会拿到独立 jwt，内部维护。
     """
 
+    _shared_outlook_usage: dict[str, int] = {}
+    _shared_outlook_map: dict[str, dict[str, str]] = {}
+    _outlook_lock = threading.RLock()
+
     def __init__(self):
-        load_dotenv(override=True)
+        load_dotenv(override=False)
+        self.email_type = (os.getenv("EMAIL_TYPE") or "freemail").strip().lower()
+        self.outlook_accounts_raw = (os.getenv("OUTLOOK_ACCOUNTS") or "").strip()
+        try:
+            self.outlook_alias_limit = max(
+                1, int(os.getenv("OUTLOOK_ALIAS_LIMIT") or "5")
+            )
+        except ValueError:
+            self.outlook_alias_limit = 5
+
+        self._outlook_accounts = self._parse_outlook_accounts()
+        self._outlook_token_cache: dict[str, tuple[str, float]] = {}
+        self._outlook_token_lock = threading.Lock()
+
         self.worker_domain = self.normalize_domain(os.getenv("WORKER_DOMAIN") or "")
         self.freemail_token = (os.getenv("FREEMAIL_TOKEN") or "").strip()
+        self.admin_key = (os.getenv("FREEMAIL_ADMIN_KEY") or "").strip()
         self.mail_domain = (os.getenv("FREEMAIL_DOMAIN") or "").strip()  # 邮箱后缀，如 kikru.xyz
-        if not self.worker_domain:
+        self.random_subdomain = (
+            os.getenv("FREEMAIL_RANDOM_SUBDOMAIN") or ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+
+        if self.email_type not in ("outlook", "outlook-hotmail") and not self.worker_domain:
             raise ValueError("Missing: WORKER_DOMAIN")
-        self.base_url = f"https://{self.worker_domain}"
+
+        self.base_url = f"https://{self.worker_domain}" if self.worker_domain else ""
         self._jwt_by_email: dict[str, str] = {}
         self._session = self._build_session()
         # 探测 API 风格：cf_temp | freemail
         self._api_style = (os.getenv("FREEMAIL_API_STYLE") or "auto").strip().lower()
         self._settings_cache: Optional[dict] = None
+
+    def _parse_outlook_accounts(self) -> list[dict[str, str]]:
+        accounts = []
+        # .env 中的多行账号列表保存为字面量 \n，运行时还原。
+        raw = (self.outlook_accounts_raw or "").replace("\\n", "\n")
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "----" in line:
+                parts = [part.strip() for part in line.split("----")]
+                email_addr = parts[0] if parts else ""
+                password = parts[1] if len(parts) > 1 else ""
+                refresh_token = parts[2] if len(parts) > 2 else ""
+                client_id = parts[3] if len(parts) > 3 else ""
+            elif ":" in line:
+                parts = line.split(":", 1)
+                email_addr = parts[0].strip()
+                password = parts[1].strip()
+                refresh_token = ""
+                client_id = ""
+            else:
+                continue
+            if email_addr and (password or (refresh_token and client_id)):
+                accounts.append(
+                    {
+                        "email": email_addr,
+                        "password": password,
+                        "refresh_token": refresh_token,
+                        "client_id": client_id,
+                    }
+                )
+        return accounts
 
     @staticmethod
     def normalize_domain(domain: str) -> str:
@@ -94,6 +154,7 @@ class EmailService:
                 "ok": False,
                 "domains": [],
                 "default_domains": [],
+                "random_subdomain_domains": [],
                 "selected": selected,
                 "message": "请先填写 WORKER_DOMAIN",
                 "settings": {},
@@ -129,6 +190,7 @@ class EmailService:
                 "ok": False,
                 "domains": [],
                 "default_domains": [],
+                "random_subdomain_domains": [],
                 "selected": selected,
                 "message": f"拉取域名失败: {last_err or '无响应'}",
                 "settings": {},
@@ -148,6 +210,11 @@ class EmailService:
             for d in (settings.get("defaultDomains") or [])
             if str(d).strip()
         ]
+        random_subdomain_domains = [
+            str(d).strip()
+            for d in (settings.get("randomSubdomainDomains") or [])
+            if str(d).strip()
+        ]
         if selected and selected not in domains and selected != "auto":
             # 仍展示当前已选，即使接口未返回
             domains.insert(0, selected)
@@ -160,6 +227,7 @@ class EmailService:
             "ok": True,
             "domains": domains,
             "default_domains": defaults,
+            "random_subdomain_domains": random_subdomain_domains,
             "selected": selected_out,
             "message": f"已拉取 {len(domains)} 个域名" if domains else "接口无域名列表",
             "settings": {
@@ -168,6 +236,10 @@ class EmailService:
                 "prefix": settings.get("prefix") or "",
                 "minAddressLen": settings.get("minAddressLen"),
                 "maxAddressLen": settings.get("maxAddressLen"),
+                "randomSubdomainDomains": random_subdomain_domains,
+                "randomSubdomainLength": settings.get(
+                    "randomSubdomainLength"
+                ),
             },
         }
 
@@ -183,11 +255,19 @@ class EmailService:
             h["Authorization"] = f"Bearer {jwt}"
         return h
 
+    def _admin_headers(self) -> dict:
+        headers = self._auth_headers()
+        headers["x-admin-auth"] = self.admin_key
+        return headers
+
     def _random_name(self, n: int = 10) -> str:
         return "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
 
     def create_email(self):
         """创建临时邮箱，返回 (jwt, email)"""
+        if self.email_type in ("outlook", "outlook-hotmail"):
+            return self._create_outlook_alias()
+
         style = self._api_style
         if style in ("auto", "cf_temp", "cloudflare"):
             result = self._create_cf_temp()
@@ -196,6 +276,326 @@ class EmailService:
             if style != "auto":
                 return None, None
         return self._create_freemail_legacy()
+
+    def _create_outlook_alias(self):
+        accounts = self._outlook_accounts
+        if not accounts:
+            print("[-] 创建邮箱失败(outlook): 未配置 OUTLOOK_ACCOUNTS")
+            return None, None
+
+        with EmailService._outlook_lock:
+            available = [
+                acc
+                for acc in accounts
+                if EmailService._shared_outlook_usage.get(
+                    acc["email"].lower(), 0
+                )
+                < self.outlook_alias_limit
+            ]
+            if not available:
+                print(
+                    "[-] 创建邮箱失败(outlook): "
+                    f"所有账号已达加号地址上限 ({self.outlook_alias_limit})"
+                )
+                return None, None
+
+            acc = min(
+                available,
+                key=lambda item: EmailService._shared_outlook_usage.get(
+                    item["email"].lower(), 0
+                ),
+            )
+            main_email = acc["email"]
+            usage_key = main_email.lower()
+
+            if "@" in main_email:
+                username, domain = main_email.rsplit("@", 1)
+            else:
+                username, domain = main_email, "outlook.com"
+
+            for _ in range(10):
+                tag = self._random_name(8)
+                alias_email = f"{username}+{tag}@{domain}"
+                if alias_email.lower() not in EmailService._shared_outlook_map:
+                    break
+            else:
+                print("[-] 创建邮箱失败(outlook): 无法生成唯一加号地址")
+                return None, None
+
+            EmailService._shared_outlook_usage[usage_key] = (
+                EmailService._shared_outlook_usage.get(usage_key, 0) + 1
+            )
+            EmailService._shared_outlook_map[alias_email.lower()] = {
+                **acc,
+                "main_email": main_email,
+            }
+        return alias_email, alias_email
+
+    def _fetch_outlook_verification_code(self, alias_email: str, max_attempts: int = 50, stop_event=None) -> Optional[str]:
+        alias_key = alias_email.lower()
+        with EmailService._outlook_lock:
+            info = EmailService._shared_outlook_map.get(alias_key)
+        if not info:
+            for acc in self._outlook_accounts:
+                main_email = acc["email"]
+                if "@" not in main_email or "@" not in alias_email:
+                    continue
+                main_local, main_domain = main_email.lower().rsplit("@", 1)
+                alias_local, alias_domain = alias_key.rsplit("@", 1)
+                if (
+                    alias_domain == main_domain
+                    and alias_local.startswith(main_local + "+")
+                ):
+                    info = {**acc, "main_email": main_email}
+                    break
+        if not info:
+            print(f"[-] Outlook 收码失败: 未找到 {alias_email} 对应的主账号凭据")
+            return None
+
+        main_email = info["main_email"]
+
+        imap_server = os.getenv("OUTLOOK_IMAP_SERVER", "outlook.office365.com").strip()
+        try:
+            imap_port = int(os.getenv("OUTLOOK_IMAP_PORT", "993").strip())
+        except ValueError:
+            imap_port = 993
+
+        import imaplib
+        import email as email_pkg
+
+        seen_msg_ids: set[str] = set()
+
+        for attempt in range(max_attempts):
+            if stop_event is not None and stop_event.is_set():
+                return None
+
+            try:
+                mail = imaplib.IMAP4_SSL(imap_server, imap_port)
+                self._authenticate_outlook_imap(mail, info)
+                mail.select("INBOX", readonly=True)
+
+                status, data = mail.search(None, "ALL")
+                if status == "OK" and data and data[0]:
+                    msg_nums = data[0].split()
+                    recent_nums = msg_nums[-15:]
+                    recent_nums.reverse()
+
+                    for num in recent_nums:
+                        if stop_event is not None and stop_event.is_set():
+                            try:
+                                mail.logout()
+                            except Exception:
+                                pass
+                            return None
+
+                        num_str = num.decode("utf-8") if isinstance(num, bytes) else str(num)
+                        if num_str in seen_msg_ids:
+                            continue
+
+                        status_fetch, msg_data = mail.fetch(num, "(RFC822)")
+                        if status_fetch != "OK" or not msg_data:
+                            continue
+
+                        raw_email = None
+                        for response_part in msg_data:
+                            if isinstance(response_part, tuple):
+                                raw_email = response_part[1]
+                                break
+
+                        if not raw_email:
+                            continue
+
+                        msg = email_pkg.message_from_bytes(raw_email)
+                        seen_msg_ids.add(num_str)
+                        if not self._outlook_message_matches_alias(
+                            msg, alias_email
+                        ):
+                            continue
+
+                        subject = msg.get("Subject", "")
+                        if subject:
+                            try:
+                                from email.header import decode_header
+                                decoded_list = decode_header(subject)
+                                subject_str = ""
+                                for b, enc in decoded_list:
+                                    if isinstance(b, bytes):
+                                        subject_str += b.decode(enc or "utf-8", errors="ignore")
+                                    else:
+                                        subject_str += str(b)
+                                subject = subject_str
+                            except Exception:
+                                pass
+
+                        body_text = ""
+                        body_html = ""
+
+                        if msg.is_multipart():
+                            for part in msg.walk():
+                                ctype = part.get_content_type()
+                                cdisp = str(part.get('Content-Disposition'))
+                                if 'attachment' in cdisp:
+                                    continue
+                                payload = part.get_payload(decode=True)
+                                if payload is None:
+                                    payload = part.get_payload()
+                                if payload:
+                                    if isinstance(payload, bytes):
+                                        charset = part.get_content_charset() or 'utf-8'
+                                        try:
+                                            text_content = payload.decode(charset, errors='ignore')
+                                        except Exception:
+                                            text_content = payload.decode('utf-8', errors='ignore')
+                                    else:
+                                        text_content = str(payload)
+                                    if ctype == 'text/plain':
+                                        body_text += text_content + "\n"
+                                    elif ctype == 'text/html':
+                                        body_html += text_content + "\n"
+                        else:
+                            payload = msg.get_payload(decode=True)
+                            if payload is None:
+                                payload = msg.get_payload()
+                            if payload:
+                                if isinstance(payload, bytes):
+                                    charset = msg.get_content_charset() or 'utf-8'
+                                    try:
+                                        body_text = payload.decode(charset, errors='ignore')
+                                    except Exception:
+                                        body_text = payload.decode('utf-8', errors='ignore')
+                                else:
+                                    body_text = str(payload)
+
+                        mail_dict = {
+                            "subject": subject,
+                            "text": body_text,
+                            "html": body_html,
+                            "from": msg.get("From", ""),
+                            "to": msg.get("To", ""),
+                        }
+
+                        code = self._extract_code_from_mail(mail_dict)
+                        if code:
+                            try:
+                                mail.logout()
+                            except Exception:
+                                pass
+                            return code
+
+                try:
+                    mail.logout()
+                except Exception:
+                    pass
+
+            except Exception:
+                pass
+
+            delay = 0.5 if attempt < 4 else 1.0
+            if stop_event is not None:
+                if stop_event.wait(timeout=delay):
+                    return None
+            else:
+                time.sleep(delay)
+
+        return None
+
+    def _authenticate_outlook_imap(self, mail, account: dict[str, str]) -> None:
+        """优先使用 OAuth2 XOAUTH2；没有 OAuth 凭据时兼容应用密码。"""
+        main_email = account["main_email"]
+        refresh_token = (account.get("refresh_token") or "").strip()
+        client_id = (account.get("client_id") or "").strip()
+        password = account.get("password") or ""
+
+        if refresh_token and client_id:
+            try:
+                access_token = self._get_outlook_access_token(account)
+                auth_string = (
+                    f"user={main_email}\x01"
+                    f"auth=Bearer {access_token}\x01\x01"
+                ).encode("utf-8")
+                mail.authenticate("XOAUTH2", lambda _challenge: auth_string)
+                return
+            except Exception as exc:
+                if not password:
+                    raise
+                print(
+                    f"[-] Outlook OAuth2 登录失败，尝试应用密码 "
+                    f"({main_email}): {exc}"
+                )
+
+        if not password:
+            raise ValueError(f"Outlook 账号缺少登录凭据: {main_email}")
+        mail.login(main_email, password)
+
+    def _get_outlook_access_token(self, account: dict[str, str]) -> str:
+        main_email = account["main_email"].lower()
+        now = time.time()
+        with self._outlook_token_lock:
+            cached = self._outlook_token_cache.get(main_email)
+            if cached and cached[1] > now + 60:
+                return cached[0]
+
+            token_url = (
+                os.getenv("OUTLOOK_TOKEN_URL")
+                or "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
+            ).strip()
+            scope = (
+                os.getenv("OUTLOOK_OAUTH_SCOPE")
+                or "https://outlook.office.com/IMAP.AccessAsUser.All offline_access"
+            ).strip()
+            response = requests.post(
+                token_url,
+                data={
+                    "client_id": account["client_id"],
+                    "grant_type": "refresh_token",
+                    "refresh_token": account["refresh_token"],
+                    "scope": scope,
+                },
+                timeout=20,
+            )
+            try:
+                payload = response.json()
+            except Exception:
+                payload = {}
+            access_token = str(payload.get("access_token") or "")
+            if response.status_code != 200 or not access_token:
+                detail = (
+                    payload.get("error_description")
+                    or payload.get("error")
+                    or f"HTTP {response.status_code}"
+                )
+                raise RuntimeError(str(detail)[:300])
+
+            try:
+                expires_in = max(300, int(payload.get("expires_in") or 3600))
+            except (TypeError, ValueError):
+                expires_in = 3600
+            self._outlook_token_cache[main_email] = (
+                access_token,
+                now + expires_in,
+            )
+            return access_token
+
+    @staticmethod
+    def _outlook_message_matches_alias(msg, alias_email: str) -> bool:
+        """只处理发给当前 +tag 的邮件，避免并发任务串验证码。"""
+        header_names = (
+            "To",
+            "Cc",
+            "Delivered-To",
+            "X-Original-To",
+            "X-Envelope-To",
+            "Envelope-To",
+        )
+        values = []
+        for name in header_names:
+            values.extend(msg.get_all(name, []))
+        recipients = {
+            address.lower()
+            for _display_name, address in getaddresses(values)
+            if address
+        }
+        return alias_email.lower() in recipients
 
     def _resolve_mail_domain(self) -> Optional[str]:
         """返回要使用的邮箱后缀；auto/空 则 None（由服务端默认）"""
@@ -207,15 +607,20 @@ class EmailService:
     def _create_cf_temp(self):
         try:
             mail_domain = self._resolve_mail_domain()
+            use_admin_api = bool(self.admin_key)
+            create_path = "/admin/new_address" if use_admin_api else "/api/new_address"
+            create_headers = self._admin_headers() if use_admin_api else self._auth_headers()
             for attempt in range(2):
                 name = self._random_name(10 if attempt == 0 else 12)
                 payload: dict = {"name": name}
                 if mail_domain:
                     payload["domain"] = mail_domain
+                if self.random_subdomain:
+                    payload["enableRandomSubdomain"] = True
                 res = self._session.post(
-                    f"{self.base_url}/api/new_address",
+                    f"{self.base_url}{create_path}",
                     json=payload,
-                    headers=self._auth_headers(),
+                    headers=create_headers,
                     timeout=20,
                 )
                 if res.status_code == 200:
@@ -228,7 +633,11 @@ class EmailService:
                         return jwt, email
                 # 名称冲突再试
                 if res.status_code != 400:
-                    print(f"[-] 创建邮箱失败(cf): {res.status_code} - {res.text[:200]}")
+                    api_kind = "admin" if use_admin_api else "api"
+                    print(
+                        f"[-] 创建邮箱失败(cf {api_kind}): "
+                        f"{res.status_code} - {res.text[:200]}"
+                    )
                     return None, None
             print(f"[-] 创建邮箱失败(cf): 重试后仍失败")
             return None, None
@@ -259,11 +668,20 @@ class EmailService:
     def fetch_verification_code(self, email, max_attempts=50, stop_event=None):
         """
         轮询收件箱提取验证码。
+        Outlook 加号地址走 IMAP；其他邮箱走 freemail API。
+
         重要：列表接口通常只有 subject/preview，必须再拉 /api/mail/{id} 详情，
         否则容易把邮件 ID、时间戳等 6 位数字误当成验证码。
 
         轮询策略：前几次快扫（0.4s），后面稳定在 0.7s，总窗口约 30s+。
         """
+        if self.email_type in ("outlook", "outlook-hotmail"):
+            return self._fetch_outlook_verification_code(
+                email,
+                max_attempts=max_attempts,
+                stop_event=stop_event,
+            )
+
         jwt = self._jwt_by_email.get(email) or self.freemail_token
         seen_ids: set[str] = set()
         for attempt in range(max_attempts):
@@ -523,6 +941,24 @@ class EmailService:
 
     def delete_email(self, address):
         """删除邮箱"""
+        if self.email_type in ("outlook", "outlook-hotmail"):
+            # 加号地址不是服务端创建的真实别名，只释放本次运行的本地占用。
+            alias_key = str(address or "").lower()
+            with EmailService._outlook_lock:
+                info = EmailService._shared_outlook_map.pop(alias_key, None)
+                if info:
+                    usage_key = info["main_email"].lower()
+                    current = EmailService._shared_outlook_usage.get(
+                        usage_key, 0
+                    )
+                    if current <= 1:
+                        EmailService._shared_outlook_usage.pop(usage_key, None)
+                    else:
+                        EmailService._shared_outlook_usage[usage_key] = (
+                            current - 1
+                        )
+            return True
+
         jwt = self._jwt_by_email.get(address) or self.freemail_token
         try:
             # cloudflare_temp_email

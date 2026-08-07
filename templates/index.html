@@ -479,6 +479,16 @@
                     </div>
                   </div>
                   <div>
+                    <label class="field-label" for="cfgAdminKey">FREEMAIL_ADMIN_KEY</label>
+                    <div class="secret-wrap">
+                      <input id="cfgAdminKey" type="password" class="field font-mono text-sm" placeholder="ADMIN_PASSWORDS 中的密码" autocomplete="off" spellcheck="false" />
+                      <button type="button" class="toggle-eye" data-target="cfgAdminKey" aria-label="显示/隐藏" title="显示/隐藏">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                      </button>
+                    </div>
+                    <p class="hint">填写后改用 /admin/new_address，不受匿名建邮开关限制</p>
+                  </div>
+                  <div>
                     <div class="flex items-center justify-between gap-2 mb-1">
                       <label class="field-label" style="margin-bottom:0" for="cfgMailDomain">邮箱后缀</label>
                       <button type="button" id="btnFetchDomains" class="btn btn-ghost text-[11px] px-2 py-0.5">拉取</button>
@@ -492,6 +502,42 @@
                       <input type="hidden" id="cfgMailDomain" value="auto" />
                     </div>
                     <p id="mailDomainHint" class="hint">点「拉取」从 freemail 取可用后缀</p>
+                    <label class="mt-2 flex items-start gap-2 text-[11px] text-ink-700/75 cursor-pointer">
+                      <input id="cfgRandomSubdomain" type="checkbox" class="mt-0.5 rounded border-paper-300 text-brand-500 focus:ring-brand-500/30" />
+                      <span>
+                        <span class="font-semibold text-ink-800">启用随机子域名</span>
+                        <span class="block" id="randomSubdomainHint">需选择 Worker 的 RANDOM_SUBDOMAIN_DOMAINS 基础域名</span>
+                      </span>
+                    </label>
+                  </div>
+                </div>
+
+                <!-- Outlook/Hotmail 加号地址 -->
+                <div class="cfg-block">
+                  <h3 class="cfg-title">邮箱 Outlook/Hotmail</h3>
+                  <div>
+                    <label class="field-label">邮箱类型</label>
+                    <div class="c-select" data-select="emailType">
+                      <button type="button" class="c-select-btn" id="cfgEmailTypeBtn">
+                        <span class="value">freemail</span>
+                        <svg class="chev" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.17l3.71-3.94a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clip-rule="evenodd"/></svg>
+                      </button>
+                      <div class="c-select-menu" role="listbox"></div>
+                      <input type="hidden" id="cfgEmailType" value="freemail" />
+                    </div>
+                  </div>
+
+                  <div id="outlookConfig" class="hidden">
+                    <div>
+                      <label class="field-label" for="cfgAccountList">账号列表（每行一个）</label>
+                      <textarea id="cfgAccountList" class="field font-mono text-sm" placeholder="test@outlook.com:应用密码&#10;test@outlook.com----应用密码----refresh_token----client_id" rows="6"></textarea>
+                      <p class="hint">生成 name+随机标签@outlook.com；有 refresh_token 时优先 OAuth2</p>
+                    </div>
+                    <div>
+                      <label class="field-label" for="cfgAliasLimit">加号地址上限</label>
+                      <input id="cfgAliasLimit" type="number" min="1" max="999" value="5" class="field font-mono text-sm" />
+                      <p class="hint">每个主账号在一次运行中分配的地址上限</p>
+                    </div>
                   </div>
                 </div>
 
@@ -890,23 +936,63 @@
       }
     );
 
+    const emailTypeSelect = initSelect(
+      document.querySelector('[data-select="emailType"]'),
+      [
+        { value: 'freemail', label: 'freemail (cloudflare_temp_email)' },
+        { value: 'outlook-hotmail', label: 'Outlook / Hotmail（加号地址）' },
+      ],
+      'freemail',
+      (val) => {
+        const isOutlook = val === 'outlook-hotmail' || val === 'outlook';
+        $('outlookConfig').classList.toggle('hidden', !isOutlook);
+      }
+    );
+
     const AUTO_DOMAIN_OPT = { value: 'auto', label: '自动（服务端默认）' };
+    let randomSubdomainDomains = new Set();
     const mailDomainSelect = initSelect(
       document.querySelector('[data-select="cfgMailDomain"]'),
       [AUTO_DOMAIN_OPT],
-      'auto'
+      'auto',
+      () => updateRandomSubdomainHint()
     );
 
-    function buildDomainOptions(domains, defaults) {
+    function buildDomainOptions(domains, defaults, randomDomains = []) {
       const opts = [AUTO_DOMAIN_OPT];
       const defSet = new Set((defaults || []).map(String));
+      const randomSet = new Set((randomDomains || []).map(String));
       for (const d of domains || []) {
         const v = String(d).trim();
         if (!v || v === 'auto') continue;
-        const tag = defSet.has(v) ? '（默认）' : '';
-        opts.push({ value: v, label: tag ? `${v} ${tag}` : v });
+        const tags = [];
+        if (defSet.has(v)) tags.push('默认');
+        if (randomSet.has(v)) tags.push('可随机子域');
+        opts.push({
+          value: v,
+          label: tags.length ? `${v}（${tags.join(' / ')}）` : v
+        });
       }
       return opts;
+    }
+
+    function updateRandomSubdomainHint() {
+      const hint = $('randomSubdomainHint');
+      if (!hint) return;
+      const domain = ($('cfgMailDomain').value || 'auto').trim();
+      if (domain === 'auto') {
+        hint.textContent = '启用后必须选择 RANDOM_SUBDOMAIN_DOMAINS 中的基础域名';
+        hint.className = 'block text-sun-600';
+      } else if (randomSubdomainDomains.size && !randomSubdomainDomains.has(domain)) {
+        hint.textContent = `${domain} 不在 Worker 返回的 RANDOM_SUBDOMAIN_DOMAINS 中`;
+        hint.className = 'block text-rose-500';
+      } else if (randomSubdomainDomains.has(domain)) {
+        hint.textContent = `将创建 name@随机串.${domain}`;
+        hint.className = 'block text-leaf-600';
+      } else {
+        hint.textContent = '请先点“拉取”确认该域名支持随机子域';
+        hint.className = 'block text-ink-700/50';
+      }
     }
 
     $('targetCustom').addEventListener('input', () => {
@@ -1070,7 +1156,9 @@
         $('envWorker').textContent = okW ? (data.env.worker_domain || '已配置') : '未配置';
         $('envWorker').className = `font-mono truncate max-w-[58%] text-right ${okW ? 'text-leaf-600' : 'text-rose-500'}`;
         const md = data.env.freemail_domain || 'auto';
-        $('envMailDomain').textContent = md === 'auto' ? '自动' : md;
+        const randomSubdomain = !!data.env.freemail_random_subdomain;
+        $('envMailDomain').textContent =
+          (md === 'auto' ? '自动' : md) + (randomSubdomain ? ' · 随机子域' : '');
         $('envMailDomain').className = 'font-mono text-ink-800';
         $('envToken').textContent = okT ? '已配置' : '未配置';
         $('envToken').className = `font-mono ${okT ? 'text-leaf-600' : 'text-rose-500'}`;
@@ -1300,8 +1388,13 @@
         const data = await res.json().catch(() => ({}));
         const domains = data.domains || [];
         const defaults = data.default_domains || [];
+        const randomDomains = data.random_subdomain_domains || [];
+        randomSubdomainDomains = new Set(randomDomains.map(String));
         const selected = data.selected || $('cfgMailDomain').value || 'auto';
-        mailDomainSelect._setOptions(buildDomainOptions(domains, defaults), true);
+        mailDomainSelect._setOptions(
+          buildDomainOptions(domains, defaults, randomDomains),
+          true
+        );
         // 若当前选中不在列表且不是 auto，保留；否则用接口 selected
         const cur = $('cfgMailDomain').value;
         if (cur && (cur === 'auto' || domains.includes(cur))) {
@@ -1309,8 +1402,11 @@
         } else if (selected) {
           mailDomainSelect._setValue(selected, true);
         }
+        updateRandomSubdomainHint();
         if (data.ok) {
-          hint.textContent = data.message || `已拉取 ${domains.length} 个域名`;
+          hint.textContent = randomDomains.length
+            ? `${data.message || `已拉取 ${domains.length} 个域名`} · ${randomDomains.length} 个支持随机子域`
+            : (data.message || `已拉取 ${domains.length} 个域名`);
           hint.className = 'mt-1 text-[11px] text-leaf-600';
         } else {
           hint.textContent = data.message || '拉取失败';
@@ -1334,6 +1430,7 @@
         const c = data.config || {};
         $('cfgWorker').value = c.WORKER_DOMAIN || '';
         $('cfgToken').value = c.FREEMAIL_TOKEN || '';
+        $('cfgAdminKey').value = c.FREEMAIL_ADMIN_KEY || '';
         $('cfgYes').value = c.YESCAPTCHA_KEY || '';
         $('cfgSolver').value = c.SOLVER_URL || 'http://127.0.0.1:5072';
         $('cfgSolverThreads').value = c.SOLVER_THREADS || '2';
@@ -1356,6 +1453,16 @@
           []
         ), false);
         mailDomainSelect._setValue(savedDomain, true);
+        $('cfgRandomSubdomain').checked = ['1', 'true', 'yes', 'on'].includes(
+          String(c.FREEMAIL_RANDOM_SUBDOMAIN || '0').toLowerCase()
+        );
+        updateRandomSubdomainHint();
+
+        const emailType = (c.EMAIL_TYPE || 'freemail').toLowerCase();
+        emailTypeSelect._setValue(emailType === 'outlook' ? 'outlook-hotmail' : emailType, true);
+        $('outlookConfig').classList.toggle('hidden', !(emailType === 'outlook' || emailType === 'outlook-hotmail'));
+        if ($('cfgAccountList')) $('cfgAccountList').value = c.OUTLOOK_ACCOUNTS || '';
+        if ($('cfgAliasLimit')) $('cfgAliasLimit').value = c.OUTLOOK_ALIAS_LIMIT || '5';
 
         setMessage($('configMessage'), '已加载当前配置', true);
         if ($('upstreamTestMessage')) {
@@ -1457,10 +1564,16 @@
     $('configForm').addEventListener('submit', async (ev) => {
       ev.preventDefault();
       const captchaMode = $('captchaMode').value;
+      const emailType = $('cfgEmailType') ? $('cfgEmailType').value : 'freemail';
       const payload = {
+        EMAIL_TYPE: emailType,
+        OUTLOOK_ACCOUNTS: ($('cfgAccountList') && $('cfgAccountList').value.trim()) || '',
+        OUTLOOK_ALIAS_LIMIT: ($('cfgAliasLimit') && $('cfgAliasLimit').value.trim()) || '5',
         WORKER_DOMAIN: $('cfgWorker').value.trim(),
         FREEMAIL_TOKEN: $('cfgToken').value.trim(),
+        FREEMAIL_ADMIN_KEY: $('cfgAdminKey').value.trim(),
         FREEMAIL_DOMAIN: ($('cfgMailDomain').value || 'auto').trim() || 'auto',
+        FREEMAIL_RANDOM_SUBDOMAIN: $('cfgRandomSubdomain').checked ? '1' : '0',
         YESCAPTCHA_KEY: captchaMode === 'yescaptcha' ? $('cfgYes').value.trim() : '',
         SOLVER_URL: $('cfgSolver').value.trim() || 'http://127.0.0.1:5072',
         SOLVER_BROWSER: $('cfgSolverBrowser').value || 'camoufox',
@@ -1475,9 +1588,28 @@
         SUB2API_GROK_GROUP_NAME: ($('cfgGroupName') && $('cfgGroupName').value.trim()) || 'grok',
         captcha_mode: captchaMode,
       };
-      if (!payload.WORKER_DOMAIN || !payload.FREEMAIL_TOKEN) {
-        setMessage($('configMessage'), 'WORKER_DOMAIN 与 FREEMAIL_TOKEN 为必填', false);
-        return;
+      if (emailType === 'outlook-hotmail' || emailType === 'outlook') {
+        if (!payload.OUTLOOK_ACCOUNTS) {
+          setMessage($('configMessage'), '请填写 Outlook 账号列表', false);
+          return;
+        }
+      } else {
+        if (!payload.WORKER_DOMAIN || !payload.FREEMAIL_TOKEN) {
+          setMessage($('configMessage'), 'WORKER_DOMAIN 与 FREEMAIL_TOKEN 为必填', false);
+          return;
+        }
+        if (payload.FREEMAIL_RANDOM_SUBDOMAIN === '1' && payload.FREEMAIL_DOMAIN === 'auto') {
+          setMessage($('configMessage'), '启用随机子域名时，请先拉取并选择基础域名', false);
+          return;
+        }
+        if (
+          payload.FREEMAIL_RANDOM_SUBDOMAIN === '1'
+          && randomSubdomainDomains.size
+          && !randomSubdomainDomains.has(payload.FREEMAIL_DOMAIN)
+        ) {
+          setMessage($('configMessage'), '所选域名不支持随机子域名，请选择标有“可随机子域”的域名', false);
+          return;
+        }
       }
       setMessage($('configMessage'), '保存中...', true);
       $('btnSaveConfig').disabled = true;
